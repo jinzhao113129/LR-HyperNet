@@ -39,7 +39,9 @@ class LRHyperNet(nn.Module):
                  kda_bidirectional: bool = False,
                  hyperbolic_type: str = "poincare",
                  use_group_norm: bool = False,
-                 hyperbolic_classifier: bool = False):
+                 hyperbolic_classifier: bool = False,
+                 use_hyperbolic_selector: bool = False,
+                 remote_dropout: float = 0.0):
         """
         Args:
             num_classes: 分类数（N-Caltech101 为 101）
@@ -70,6 +72,10 @@ class LRHyperNet(nn.Module):
                 GroupNorm 统计量与 batch size 无关。注意 LRHyperNet 内部的
                 LocalRemoteGrouper/KDA/HyperbolicRemoteAggregator 均不含 BN
                 （只用 LayerNorm），无需处理。
+            use_hyperbolic_selector: 双曲距离选16个远程点（学长建议）。
+                RemoteSelector 中先 exp map 到双曲空间，再用双曲距离
+                代替欧氏距离选远程邻居。与 hyperbolic_type 配合使用
+                （lorentz 推荐，数值更稳定）。
         """
         super().__init__()
         if time_enc and kda:
@@ -106,7 +112,9 @@ class LRHyperNet(nn.Module):
                 True, "center", curvature_init=curvature_init,
                 use_global_anchor=use_global_anchor, anchor_lambda=anchor_lambda,
                 kda=kda, kda_bidirectional=kda_bidirectional,
-                hyperbolic_type=hyperbolic_type)
+                hyperbolic_type=hyperbolic_type,
+                use_hyperbolic_selector=use_hyperbolic_selector,
+                                      remote_dropout=remote_dropout)
             self.local_grouper_list.append(local_grouper)
             aggregation = Attention(self.feature_list[i + 1])
             self.aggregation_list.append(aggregation)

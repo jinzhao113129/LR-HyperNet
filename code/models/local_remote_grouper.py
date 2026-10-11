@@ -145,7 +145,10 @@ class RemoteSelector(nn.Module):
     """
 
     def __init__(self, remote_g: int = 16, chunk: int = 1024,
-                 anchor_lambda: float = 0.5):
+                 anchor_lambda: float = 0.5,
+                 use_hyperbolic: bool = False,
+                 curvature_init: float = 0.4,
+                 hyperbolic_type: str = "lorentz"):
         """
         Args:
             remote_g: 每个中心点选取的远程邻居数 G
@@ -154,11 +157,42 @@ class RemoteSelector(nn.Module):
                 混合距离 d = d_to_centroid + anchor_lambda * d_to_global_anchor，
                 即远程点同时要求"与中心点特征差异大"且"与全局表征差异大"。
                 为 0 时退化为原版（仅特征距离 top-k）。
+            use_hyperbolic: 是否用双曲距离选点（学长建议：16个点在双曲空间里找）。
+                True 时先 exp map 到双曲空间，再用双曲距离代替欧氏距离。
+            curvature_init: 双曲曲率初始值（仅 use_hyperbolic=True 时有效）
+            hyperbolic_type: "poincare" 或 "lorentz"（仅 use_hyperbolic=True 时有效）
         """
         super().__init__()
         self.remote_g = remote_g
         self.chunk = chunk
         self.anchor_lambda = anchor_lambda
+        self.use_hyperbolic = use_hyperbolic
+        self.curvature_init = curvature_init
+        self.hyperbolic_type = hyperbolic_type.lower()
+        if use_hyperbolic:
+            # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
+            self.register_buffer("c", torch.tensor(curvature_init))
+
+    def _hyp_dist_chunk(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+        """分块双曲距离计算。
+
+        Args:
+            centroid: [B, S, C] 中心点欧氏特征
+            points: [B, c, C] 当前块的点欧氏特征
+        Returns:
+            dist: [B, S, c] 双曲距离
+        """
+        c = torch.abs(self.c) + 1e-4
+        if self.hyperbolic_type == "poincare":
+            centroid_h = poincare_exp_origin(centroid, c)  # [B, S, C]
+            points_h = poincare_exp_origin(points, c)      # [B, c, C]
+            return poincare_distance(
+                centroid_h.unsqueeze(2), points_h.unsqueeze(1), c)
+        else:  # lorentz
+            centroid_h = lorentz_exp_origin(centroid, c)  # [B, S, C+1]
+            points_h = lorentz_exp_origin(points, c)      # [B, c, C+1]
+            return lorentz_distance(
+                centroid_h.unsqueeze(2), points_h.unsqueeze(1), c)
 
     @staticmethod
     def _exclude_local(chunk_dist: torch.Tensor, local_idx: torch.Tensor,
@@ -211,10 +245,18 @@ class RemoteSelector(nn.Module):
                 c = end - start
                 # 尾块可能不足 G 个元素：块内取 min(G, c) 个，不足则整块全作候选
                 k = min(G, c)
-                chunk_dist = square_distance(centroid_feat, all_feat[:, start:end, :])
+                if self.use_hyperbolic:
+                    chunk_dist = self._hyp_dist_chunk(
+                        centroid_feat, all_feat[:, start:end, :])
+                else:
+                    chunk_dist = square_distance(centroid_feat, all_feat[:, start:end, :])
                 if global_anchor is not None:
                     # PVAG 式全局吸收：混合"到中心点"与"到全局锚点"的距离
-                    anchor_dist = square_distance(global_anchor, all_feat[:, start:end, :])
+                    if self.use_hyperbolic:
+                        anchor_dist = self._hyp_dist_chunk(
+                            global_anchor, all_feat[:, start:end, :])
+                    else:
+                        anchor_dist = square_distance(global_anchor, all_feat[:, start:end, :])
                     chunk_dist = chunk_dist + self.anchor_lambda * anchor_dist
                 chunk_dist = self._exclude_local(chunk_dist, local_idx, start)
                 # largest=True：选特征距离最远的 G 个（排除项已是 -inf 不会被选中）
@@ -222,10 +264,27 @@ class RemoteSelector(nn.Module):
             cand_idx = torch.cat(topk_list, dim=-1)  # [B, S, n_chunks*G]
             # 候选并集上重算距离，取全局 top-G
             cand_points = index_points(all_feat, cand_idx)  # [B, S, n_chunks*G, C]
-            cand_dist = ((cand_points - centroid_feat.unsqueeze(-2)) ** 2).sum(-1)
+            if self.use_hyperbolic:
+                # 双曲距离：按 batch*group 展平后批量计算，再恢复形状
+                Bc, Sc, Nc, Cc = cand_points.shape
+                centroid_flat = centroid_feat.reshape(Bc * Sc, 1, Cc)
+                cand_flat = cand_points.reshape(Bc * Sc, Nc, Cc)
+                cand_dist = self._hyp_dist_chunk(
+                    centroid_flat, cand_flat
+                ).reshape(Bc, Sc, Nc)
+            else:
+                cand_dist = ((cand_points - centroid_feat.unsqueeze(-2)) ** 2).sum(-1)
             if global_anchor is not None:
-                cand_anchor_dist = (
-                    (cand_points - global_anchor.unsqueeze(-2)) ** 2).sum(-1)
+                if self.use_hyperbolic:
+                    Bc, Sc, Nc, Cc = cand_points.shape
+                    anchor_flat = global_anchor.reshape(Bc * Sc, 1, Cc)
+                    cand_flat = cand_points.reshape(Bc * Sc, Nc, Cc)
+                    cand_anchor_dist = self._hyp_dist_chunk(
+                        anchor_flat, cand_flat
+                    ).reshape(Bc, Sc, Nc)
+                else:
+                    cand_anchor_dist = (
+                        (cand_points - global_anchor.unsqueeze(-2)) ** 2).sum(-1)
                 cand_dist = cand_dist + self.anchor_lambda * cand_anchor_dist
             final = cand_dist.topk(G, dim=-1, largest=True)[1]
             remote_idx = torch.gather(cand_idx, -1, final)
@@ -518,7 +577,9 @@ class LocalRemoteGrouper(nn.Module):
                  normalize: str = "center", curvature_init: float = 0.4,
                  use_global_anchor: bool = False, anchor_lambda: float = 0.5,
                  kda: bool = False, kda_bidirectional: bool = False,
-                 hyperbolic_type: str = "poincare", **kwargs):
+                 hyperbolic_type: str = "poincare",
+                 use_hyperbolic_selector: bool = False,
+                 remote_dropout: float = 0.0, **kwargs):
         """
         Args:
             channel: 输入特征维度 C
@@ -539,6 +600,7 @@ class LocalRemoteGrouper(nn.Module):
                 仅 kda=True 时生效，前向+后向各跑一次后融合。
             hyperbolic_type: "poincare"（庞加莱球，原版）或 "lorentz"
                 （洛伦兹模型，v3.1 新增，消除边界梯度尖峰）
+            remote_dropout: 远程聚合输出后的 dropout 概率（缓解双曲过拟合）
         """
         super().__init__()
         self.groups = groups
@@ -558,7 +620,10 @@ class LocalRemoteGrouper(nn.Module):
         self.kda_enc = KDACausalEncoder(channel, bidirectional=kda_bidirectional) if kda else None
         # Remote 分支：远程邻居选择 + 双曲聚合
         self.remote_selector = RemoteSelector(remote_g=remote_g,
-                                              anchor_lambda=anchor_lambda)
+                                              anchor_lambda=anchor_lambda,
+                                              use_hyperbolic=use_hyperbolic_selector,
+                                              curvature_init=curvature_init,
+                                              hyperbolic_type=hyperbolic_type)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
         else:
@@ -568,6 +633,8 @@ class LocalRemoteGrouper(nn.Module):
         self.use_global_anchor = use_global_anchor
         if use_global_anchor:
             self.global_anchor = nn.Parameter(torch.zeros(channel))
+        # 远程聚合输出 dropout（缓解双曲过拟合）
+        self.remote_dropout = nn.Dropout(remote_dropout)
 
     def _knn_idx(self, new_points: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
         """分块 KNN（与原 LocalGrouper 的显存优化实现完全一致）。
@@ -638,6 +705,7 @@ class LocalRemoteGrouper(nn.Module):
         remote_idx = self.remote_selector(centroid_feat, points, idx, anchor)  # [B, S, G]
         remote_points = index_points(points, remote_idx)               # [B, S, G, C]
         remote_feat = self.hyper_agg(remote_points)                    # [B, S, C]
+        remote_feat = self.remote_dropout(remote_feat)
         if self.use_global_anchor:
             # 全局吸收节点注入（PVAG 思路，保证可导）：
             # 远程选择（离散索引）本身不可导，锚点梯度经此处加法路径回流，

@@ -59,6 +59,11 @@ def parse_args():
                         choices=['poincare', 'lorentz', 'euclidean'],
                         help='hyperbolic space type: poincare (default), lorentz (v3.1, no boundary '
                              'gradient spike), or euclidean (ablation control, same backbone/params)')
+    parser.add_argument('--remote_dropout', type=float, default=0.0,
+                        help='dropout on remote aggregator output (anti-overfit)')
+    parser.add_argument('--use_hyperbolic_selector', action='store_true', default=False,
+                        help='双曲距离选16个远程点（学长建议）：RemoteSelector 中先 exp map 到双曲空间，'
+                             '再用双曲距离代替欧氏距离选远程邻居。配合 --hyperbolic_type lorentz 使用')
     parser.add_argument('--sanity_5class', action='store_true', default=False,
                         help='5-class subset overfit sanity check (Task B): filter label<5 samples '
                              'from train/test h5, num_category forced to 5, epoch capped at 50, '
@@ -411,8 +416,10 @@ def main(args):
                             kda=args.kda,
                             kda_bidirectional=args.kda_bidirectional,
                             hyperbolic_type=args.hyperbolic_type,
-                     hyperbolic_classifier=args.hyperbolic_classifier,
-                            use_group_norm=args.group_norm)
+                            hyperbolic_classifier=args.hyperbolic_classifier,
+                            use_group_norm=args.group_norm,
+                            use_hyperbolic_selector=args.use_hyperbolic_selector,
+                            remote_dropout=args.remote_dropout)
     log_string('Model: LRHyperNet (remote_g=%d, curvature_init=%s, time_enc=%s, kda=%s, '
                'kda_bidirectional=%s, use_global_anchor=%s, anchor_lambda=%s, hyperbolic_type=%s)' % (
                    args.remote_g, args.curvature_init, args.time_enc, args.kda,
