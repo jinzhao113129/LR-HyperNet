@@ -1,0 +1,56 @@
+# 数据文件（太大，不提交）
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.npy
+*.npz
+data/
+ncaltech101*/
+
+# 训练产物
+checkpoints/
+log/
+logs/
+tensorboard_log/
+eval_results/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# 敏感信息
+.env
+.env.*
+*.key
+*.pem
+secrets.json
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 大文件
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# HPC 备份
+__hpc_latest/
