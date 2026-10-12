@@ -43,7 +43,13 @@ class LRHyperNet(nn.Module):
                  use_hyperbolic_selector: bool = False,
                  remote_dropout: float = 0.0,
                  use_rp1_selector: bool = False,
-                 rp1_lambda: float = 1.0):
+                 rp1_lambda: float = 1.0,
+                 selector_mode: str = "topk",
+                 div_lambda: float = 1.0,
+                 remote_gate: bool = False,
+                 remote_kda: bool = False,
+                 density_channel: bool = False,
+                 density_bins: int = 32):
         """
         Args:
             num_classes: 分类数（N-Caltech101 为 101）
@@ -84,6 +90,16 @@ class LRHyperNet(nn.Module):
                 spatial novelty 的选择器优于纯特征距离 top-k，
                 Oracle 68% vs 简单 KNN 61%）。False 时行为与原版完全一致。
             rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
+            selector_mode: 远程点选择模式，"topk"（独立打分，默认）或 "greedy_div"（贪心最大-最小多样性，RP1启发）
+            div_lambda: 多样性权重（仅 selector_mode="greedy_div" 时有效），越大远程点越分散
+            remote_gate: SECNet式远程分支门控融合。中心点特征生成sigmoid门控，乘性调制远程特征（非加性），初始化bias=2.0起步等价直连
+            remote_kda: EventMamba启发的远程KDA扫描。复用KDACausalEncoder对远程16点按时间排序做因果递推，捕获长程时序演变，残差加法
+            density_channel: 密度输入通道（SpikePoint启发的rate coding密度信息）。
+                对每个事件统计其所在 32x32 空间体素内的事件数并 log1p 压缩，
+                作为第 5 个输入通道拼进 embed 输入。事件相机里"同坐标连续激发
+                （边缘/运动）vs 孤立单发（噪声）"是截然不同的信号，密度通道
+                让嵌入层直接感知局部激发率。默认 False 保证旧实验可复现。
+            density_bins: 密度统计的空间体素边长（默认 32，即 32x32 体素）
         """
         super().__init__()
         if time_enc and kda:
@@ -96,10 +112,15 @@ class LRHyperNet(nn.Module):
         self.time_enc = time_enc
         self.kda = kda
         self.hyperbolic_type = hyperbolic_type
+        self.density_channel = density_channel
+        self.density_bins = density_bins
 
         # 时间因果序编码时输入维度 = x,y,p(3) + t(1) + 4 个频率 sin/cos(8) = 12
         # KDA/v1 路径输入维度 = 4（(t,x,y,p) 原样）
         embed_in_dim = 12 if time_enc else 4
+        # 密度通道开启时各路径输入维度 +1
+        if density_channel:
+            embed_in_dim += 1
         self.embed_dim = Linear1Layer(embed_in_dim, self.feature_list[0], 1,
                                       use_group_norm=use_group_norm)
         self.local_grouper_list = nn.ModuleList()
@@ -124,7 +145,11 @@ class LRHyperNet(nn.Module):
                 use_hyperbolic_selector=use_hyperbolic_selector,
                 remote_dropout=remote_dropout,
                 use_rp1_selector=use_rp1_selector,
-                rp1_lambda=rp1_lambda)
+                rp1_lambda=rp1_lambda,
+                selector_mode=selector_mode,
+                div_lambda=div_lambda,
+                remote_gate=remote_gate,
+                remote_kda=remote_kda)
             self.local_grouper_list.append(local_grouper)
             aggregation = Attention(self.feature_list[i + 1])
             self.aggregation_list.append(aggregation)
@@ -171,6 +196,21 @@ class LRHyperNet(nn.Module):
         """
         xyz = x.permute(0, 2, 1)  # [B, N, 4]（原样传给 grouper，保持 4 维语义）
         batch_size, _, _ = x.size()
+        # 密度输入通道（SpikePoint启发的rate coding密度信息）：
+        # 统计每个事件所在空间体素内的事件数并 log1p 压缩长尾。
+        # 同坐标连续激发（边缘/运动）密度高，孤立单发（噪声）密度低，
+        # 给嵌入层显式提供局部激发率信息。仅拼进 embed 输入，xyz 保持 4 维。
+        density = None
+        if self.density_channel:
+            # x: [B, 4, N]，t,x,y 已归一化到 [0,1]
+            bins = self.density_bins
+            B_, _, N_ = x.shape
+            xi = (x[:, 1] * bins).long().clamp(0, bins - 1)   # [B, N]
+            yi = (x[:, 2] * bins).long().clamp(0, bins - 1)   # [B, N]
+            vox = xi * bins + yi                              # [B, N] 展平体素索引
+            count = torch.zeros(B_, bins * bins, device=x.device)
+            count.scatter_add_(1, vox, torch.ones_like(vox, dtype=torch.float))
+            density = count.gather(1, vox).log1p()            # [B, N]，log压缩长尾
         embed_in = x
         if self.time_enc:
             # 时间因果序编码：对 t（通道0）做多频正弦位置编码（Transformer 式），
@@ -184,7 +224,14 @@ class LRHyperNet(nn.Module):
                 parts.append(torch.sin(2 * math.pi * freq * t))
                 parts.append(torch.cos(2 * math.pi * freq * t))
             t_enc = torch.cat(parts, dim=-1)  # [B, N, 9] = t + 4sin + 4cos
-            embed_in = torch.cat([xy, p, t_enc], dim=-1).permute(0, 2, 1)  # [B, 12, N]
+            if density is not None:
+                # 密度通道同步拼进 time_enc 路径：[B, N, 13] = xy,p + t_enc + density
+                embed_in = torch.cat(
+                    [xy, p, t_enc, density.unsqueeze(-1)], dim=-1).permute(0, 2, 1)
+            else:
+                embed_in = torch.cat([xy, p, t_enc], dim=-1).permute(0, 2, 1)  # [B, 12, N]
+        elif density is not None:
+            embed_in = torch.cat([x, density.unsqueeze(1)], dim=1)  # [B, 5, N]
         x = self.embed_dim(embed_in)
         x = x.permute(0, 2, 1)
         for i in range(self.stages):

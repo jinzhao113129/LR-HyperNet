@@ -152,7 +152,9 @@ class RemoteSelector(nn.Module):
                  curvature_init: float = 0.4,
                  hyperbolic_type: str = "lorentz",
                  use_rp1_selector: bool = False,
-                 rp1_lambda: float = 1.0):
+                 rp1_lambda: float = 1.0,
+                 selector_mode: str = "topk",
+                 div_lambda: float = 1.0):
         """
         Args:
             remote_g: 每个中心点选取的远程邻居数 G
@@ -171,6 +173,15 @@ class RemoteSelector(nn.Module):
                 即优先选"特征不相似且空间位置新颖"的远程点（RP1 论文：
                 Oracle 68% vs 简单 KNN 61%）。False 时保持原行为不变。
             rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
+            selector_mode: 远程点最终选择策略。
+                "topk"：原版独立 top-G 打分（默认，行为完全不变）；
+                "greedy_div"：贪心 max-min 多样性选择——第 1 个点取得分
+                最高的，后续每个点选 "得分 + div_lambda * (与已选集合的
+                最小特征距离)" 最大的，避免 G 个远程点全落在同一特征
+                方向（独立 top-k 的冗余问题）。
+            div_lambda: 多样性项权重（仅 selector_mode="greedy_div" 时有效）。
+                为 0 时贪心退化为逐个 argmax，等价于 top-k 排序结果，
+                完全回退原行为。
         """
         super().__init__()
         self.remote_g = remote_g
@@ -182,6 +193,11 @@ class RemoteSelector(nn.Module):
         # RP1 空间新颖性选择器（消融实验）
         self.use_rp1_selector = use_rp1_selector
         self.rp1_lambda = rp1_lambda
+        # 贪心多样性选择器（greedy_div）
+        assert selector_mode in ("topk", "greedy_div"), \
+            f"selector_mode must be 'topk' or 'greedy_div', got {selector_mode}"
+        self.selector_mode = selector_mode
+        self.div_lambda = div_lambda
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
@@ -252,6 +268,46 @@ class RemoteSelector(nn.Module):
             min_sq = d if min_sq is None else torch.minimum(min_sq, d)
         # 开方得到欧氏距离（加 eps 防 0 距离时梯度/数值问题）
         return torch.sqrt(min_sq + 1e-12)
+
+    @staticmethod
+    def _greedy_div_select(cand_dist: torch.Tensor, cand_points: torch.Tensor,
+                           G: int, div_lambda: float) -> torch.Tensor:
+        """贪心 max-min 多样性选择（在候选并集上，替代独立 top-G 打分）。
+
+        动机：独立 top-k 打分会让 G 个远程点全落在同一特征方向（冗余）。
+        贪心 max-min：第 1 个点取得分最高的；后续每个点选
+            score = 得分 + div_lambda * (与已选集合的最小特征距离)
+        最大的，既保证高分又保证特征方向彼此分散。
+
+        Args:
+            cand_dist: [B, S, M] 候选点得分（含 -inf 排除项）
+            cand_points: [B, S, M, C] 候选点特征
+            G: 需要选取的点数
+            div_lambda: 多样性项权重
+        Returns:
+            final: [B, S, G] 选中的候选局部索引（保持贪心选取顺序）
+        """
+        # 第 1 个点：得分最高的（-inf 排除项不会被选中）
+        sel = cand_dist.argmax(dim=-1, keepdim=True)  # [B, S, 1]
+        for _ in range(G - 1):
+            g = sel.shape[-1]
+            # 已选点特征 [B, S, g, C]
+            sel_pts = torch.gather(
+                cand_points, 2,
+                sel.unsqueeze(-1).expand(-1, -1, -1, cand_points.shape[-1]))
+            # 每个候选点到已选集合的最小特征距离 [B, S, M]
+            d = ((cand_points.unsqueeze(3) - sel_pts.unsqueeze(2)) ** 2).sum(-1)
+            d_sel = d.min(dim=-1)[0]
+            score = cand_dist + div_lambda * d_sel
+            # 已选点置 -inf，不重复选
+            score = score.scatter(2, sel, float("-inf"))
+            sel = torch.cat(
+                [sel, score.argmax(dim=-1, keepdim=True)], dim=-1)  # [B, S, g+1]
+        # 用 mask 把贪心选中序转回 top-k 索引形式（保持选取顺序，非按分值排序）
+        mask = torch.zeros_like(cand_dist)
+        mask.scatter_(2, sel, 1.0)
+        return (cand_dist * mask - 1e9 * (1 - mask)).topk(
+            G, dim=-1, largest=True)[1]
 
     def forward(self, centroid_feat: torch.Tensor, all_feat: torch.Tensor,
                 local_idx: torch.Tensor,
@@ -344,7 +400,15 @@ class RemoteSelector(nn.Module):
                     cand_anchor_dist = (
                         (cand_points - global_anchor.unsqueeze(-2)) ** 2).sum(-1)
                 cand_dist = cand_dist + self.anchor_lambda * cand_anchor_dist
-            final = cand_dist.topk(G, dim=-1, largest=True)[1]
+            if self.selector_mode == "greedy_div" and self.div_lambda != 0.0:
+                # 贪心 max-min 多样性选择：score = 得分 + λ * 到已选集合的最小
+                # 特征距离，避免 G 个远程点全落在同一特征方向。G 次循环、
+                # 候选数 M≈n_chunks*G（~160），开销可忽略
+                final = self._greedy_div_select(
+                    cand_dist, cand_points, G, self.div_lambda)
+            else:
+                # 原版独立 top-G 打分（topk 模式，或 div_lambda=0 完全回退原行为）
+                final = cand_dist.topk(G, dim=-1, largest=True)[1]
             remote_idx = torch.gather(cand_idx, -1, final)
         return remote_idx.sort(dim=-1)[0]
 
@@ -662,12 +726,17 @@ class LocalRemoteGrouper(nn.Module):
                  normalize: str = "center", curvature_init: float = 0.4,
                  use_global_anchor: bool = False, anchor_lambda: float = 0.5,
                  kda: bool = False, kda_bidirectional: bool = False,
+                 remote_kda: bool = False,
                  hyperbolic_type: str = "poincare",
                  use_hyperbolic_selector: bool = False,
                  remote_dropout: float = 0.0,
                  remote_stochastic_depth: float = 0.1,
                  use_rp1_selector: bool = False,
-                 rp1_lambda: float = 1.0, **kwargs):
+                 rp1_lambda: float = 1.0,
+                 selector_mode: str = "topk",
+                 div_lambda: float = 1.0,
+                 remote_gate: bool = False,
+                 **kwargs):
         """
         Args:
             channel: 输入特征维度 C
@@ -686,6 +755,11 @@ class LocalRemoteGrouper(nn.Module):
                 替代 v2 的 sin/cos 位置编码（time_enc），输出维度不变 [C]。
             kda_bidirectional: KDA 是否双向因果递推（v3.1，HydraMamba 启发）。
                 仅 kda=True 时生效，前向+后向各跑一次后融合。
+            remote_kda: 是否对远程 G 个点做 KDA 因果时间编码（EventMamba
+                启发）。远程分支原本是纯集合操作（无序双曲注意力聚合），
+                远程点之间的时序关系丢失；启用时复用 KDACausalEncoder
+                对远程点按时间戳做 gated delta rule 扫描，残差加法同局部
+                KDA 的接法。默认 False 保证旧实验可复现。
             hyperbolic_type: "poincare"（庞加莱球，原版）或 "lorentz"
                 （洛伦兹模型，v3.1 新增，消除边界梯度尖峰）
             remote_dropout: 远程聚合输出后的 dropout 概率（缓解双曲过拟合）
@@ -698,6 +772,15 @@ class LocalRemoteGrouper(nn.Module):
                 spatial novelty 的选择器优于纯特征距离 top-k）。
                 False 时行为与原版完全一致。
             rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
+            selector_mode: 远程点选择策略 "topk"（原版）/ "greedy_div"
+                （贪心 max-min 多样性选择，见 RemoteSelector）
+            div_lambda: 多样性项权重（仅 selector_mode="greedy_div" 时有效）
+            remote_gate: 是否启用远程分支门控融合（SECNet 启发的 gated fusion）。
+                True 时 gate = sigmoid(MLP([remote_feat, centroid_feat]))，
+                remote_feat = remote_feat * gate，由网络学习逐通道抑制无效的
+                远程特征；最后一层初始化 weight=0、bias=2.0，起步 gate≈0.88
+                ≈直连，与未启用时行为接近。False 时保持原直连行为不变
+                （保证旧实验可复现）。
         """
         super().__init__()
         self.groups = groups
@@ -715,6 +798,9 @@ class LocalRemoteGrouper(nn.Module):
             self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, channel + add_channel]))
         # KDA 因果时间编码（可选）：局部特征按时间因果扫描，替代 time_enc
         self.kda_enc = KDACausalEncoder(channel, bidirectional=kda_bidirectional) if kda else None
+        # 远程 KDA 因果时间编码（可选，EventMamba 启发）：远程 G 点按时间戳
+        # 扫描，恢复纯集合操作丢失的远程点间时序关系；v3.2 数值修复自动继承
+        self.remote_kda_enc = KDACausalEncoder(channel) if remote_kda else None
         # Remote 分支：远程邻居选择 + 双曲聚合
         self.remote_selector = RemoteSelector(remote_g=remote_g,
                                               anchor_lambda=anchor_lambda,
@@ -722,7 +808,9 @@ class LocalRemoteGrouper(nn.Module):
                                               curvature_init=curvature_init,
                                               hyperbolic_type=hyperbolic_type,
                                               use_rp1_selector=use_rp1_selector,
-                                              rp1_lambda=rp1_lambda)
+                                              rp1_lambda=rp1_lambda,
+                                              selector_mode=selector_mode,
+                                              div_lambda=div_lambda)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
         else:
@@ -736,6 +824,20 @@ class LocalRemoteGrouper(nn.Module):
         self.remote_dropout = nn.Dropout(remote_dropout)
         # 远程聚合支路 stochastic depth 概率（训练时生效）
         self.remote_stochastic_depth = remote_stochastic_depth
+        # 远程分支门控融合（SECNet 启发）：由 [remote_feat, centroid_feat]
+        # 生成逐通道门控，学习性抑制无效远程特征；默认关闭保持原行为
+        self.use_remote_gate = remote_gate
+        if remote_gate:
+            # 门控 MLP：Linear(2C→C) → GELU → Linear(C→C)
+            self.remote_gate = nn.Sequential(
+                nn.Linear(channel * 2, channel),
+                nn.GELU(),
+                nn.Linear(channel, channel),
+            )
+            # 初始化：最后一层 weight=0、bias=2.0，起步 gate=sigmoid(2)≈0.88，
+            # 近似全通（≈原直连行为），训练中由梯度自行学习开/关门
+            nn.init.zeros_(self.remote_gate[-1].weight)
+            nn.init.constant_(self.remote_gate[-1].bias, 2.0)
 
     def _knn_idx(self, new_points: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
         """分块 KNN（与原 LocalGrouper 的显存优化实现完全一致）。
@@ -808,6 +910,12 @@ class LocalRemoteGrouper(nn.Module):
         remote_idx = self.remote_selector(centroid_feat, points, idx, anchor,
                                           xytp[:, :, 0:3])  # [B, S, G]
         remote_points = index_points(points, remote_idx)               # [B, S, G, C]
+        if self.remote_kda_enc is not None:
+            # 远程 KDA 时间编码（EventMamba 启发）：残差加法同局部 KDA 接法，
+            # KDA 内部按时间戳自动排序，恢复远程点间的时序因果关系
+            remote_xytp = index_points(xytp, remote_idx)               # [B, S, G, 4]
+            remote_points = remote_points + self.remote_kda_enc(
+                remote_points, remote_xytp[..., 0:1])                  # [B, S, G, C]
         # ---- stochastic depth：训练时以 p_drop 概率逐样本跳过双曲远程聚合支路 ----
         # 展平为 [M, G, C]（M = B*S，每个 FPS 组独立伯努利），跳过的组直接用
         # 残差 x.mean(dim=1)（组均值）代替 hyper_agg 输出；推理（self.training=False）
@@ -824,6 +932,13 @@ class LocalRemoteGrouper(nn.Module):
         else:
             remote_feat = self.hyper_agg(remote_points)                # [B, S, C]
         remote_feat = self.remote_dropout(remote_feat)
+        # ---- 门控融合（SECNet 启发，remote_gate=True 时生效）----
+        # gate = sigmoid(MLP([remote_feat, centroid_feat]))：由中心点特征决定
+        # 远程特征的逐通道通过率，初始化下 gate≈0.88，起步近似原直连行为
+        if self.use_remote_gate:
+            gate = torch.sigmoid(self.remote_gate(
+                torch.cat([remote_feat, centroid_feat], dim=-1)))  # [B, S, C]
+            remote_feat = remote_feat * gate
         if self.use_global_anchor:
             # 全局吸收节点注入（PVAG 思路，保证可导）：
             # 远程选择（离散索引）本身不可导，锚点梯度经此处加法路径回流，
