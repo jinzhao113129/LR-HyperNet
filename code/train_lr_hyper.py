@@ -69,6 +69,11 @@ def parse_args():
                              '特征距离 + rp1_lambda * 候选点与局部邻居的最小空间欧氏距离')
     parser.add_argument('--rp1_lambda', type=float, default=1.0,
                         help='RP1 空间新颖性权重（仅 --use_rp1_selector 时有效）')
+    parser.add_argument('--selector_mode', type=str, default='topk',
+                        choices=['topk', 'greedy_div', 'random', 'spatial_uniform'],
+                        help='远程点选择模式：topk（特征距离独立 top-G，默认）/ greedy_div（贪心 max-min '
+                             '多样性）/ random（非局部候选中随机选 G，RP1 论文随机基线）/ spatial_uniform'
+                             '（x,y 空间均匀网格采样，RP1 论文最好的 cheap selector）')
     parser.add_argument('--sanity_5class', action='store_true', default=False,
                         help='5-class subset overfit sanity check (Task B): filter label<5 samples '
                              'from train/test h5, num_category forced to 5, epoch capped at 50, '
@@ -458,13 +463,15 @@ def main(args):
                             use_hyperbolic_selector=args.use_hyperbolic_selector,
                             remote_dropout=args.remote_dropout,
                             use_rp1_selector=args.use_rp1_selector,
-                            rp1_lambda=args.rp1_lambda)
+                            rp1_lambda=args.rp1_lambda,
+                            selector_mode=args.selector_mode)
     log_string('Model: LRHyperNet (remote_g=%d, curvature_init=%s, time_enc=%s, kda=%s, '
                'kda_bidirectional=%s, use_global_anchor=%s, anchor_lambda=%s, hyperbolic_type=%s, '
-               'use_rp1_selector=%s, rp1_lambda=%s)' % (
+               'use_rp1_selector=%s, rp1_lambda=%s, selector_mode=%s)' % (
                    args.remote_g, args.curvature_init, args.time_enc, args.kda,
                    args.kda_bidirectional, args.use_global_anchor, args.anchor_lambda,
-                   args.hyperbolic_type, args.use_rp1_selector, args.rp1_lambda))
+                   args.hyperbolic_type, args.use_rp1_selector, args.rp1_lambda,
+                   args.selector_mode))
     criterion = cal_loss
     classifier.apply(inplace_relu)
     device = 'cpu' if args.use_cpu else 'cuda'

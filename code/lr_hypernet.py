@@ -90,7 +90,9 @@ class LRHyperNet(nn.Module):
                 spatial novelty 的选择器优于纯特征距离 top-k，
                 Oracle 68% vs 简单 KNN 61%）。False 时行为与原版完全一致。
             rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
-            selector_mode: 远程点选择模式，"topk"（独立打分，默认）或 "greedy_div"（贪心最大-最小多样性，RP1启发）
+            selector_mode: 远程点选择模式："topk"（特征距离独立 top-G，默认）、"greedy_div"（贪心最大-最小
+                多样性，RP1启发）、"random"（非局部候选并集中随机选 G，RP1 论文随机基线）、
+                "spatial_uniform"（x,y 空间均匀网格采样，RP1 论文最好的 cheap selector，G=16 时 4×4 网格）
             div_lambda: 多样性权重（仅 selector_mode="greedy_div" 时有效），越大远程点越分散
             remote_gate: SECNet式远程分支门控融合。中心点特征生成sigmoid门控，乘性调制远程特征（非加性），初始化bias=2.0起步等价直连
             remote_kda: EventMamba启发的远程KDA扫描。复用KDACausalEncoder对远程16点按时间排序做因果递推，捕获长程时序演变，残差加法

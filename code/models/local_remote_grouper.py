@@ -144,6 +144,13 @@ class RemoteSelector(nn.Module):
     [B, S, N] 在 N=10240 时过大，按 N 分块保留块内 top-G（largest），
     候选并集上再取全局 top-G。正确性论证同分块 KNN：全局 top-G 的每个
     元素必然是其所在 chunk 内的 top-G。
+
+    selector_mode（RP1 论文的选点模式消融）：
+      - "topk"：特征距离 top-G（默认，上述行为）
+      - "greedy_div"：贪心 max-min 多样性选择
+      - "random"：候选并集中随机采样 G 个（RP1 随机基线，不用距离打分）
+      - "spatial_uniform"：x,y 空间均匀网格采样（RP1 最好的 cheap selector）
+    后两种模式不计算 cand_dist，块内候选也改为随机收集（不依赖特征距离）。
     """
 
     def __init__(self, remote_g: int = 16, chunk: int = 1024,
@@ -178,7 +185,14 @@ class RemoteSelector(nn.Module):
                 "greedy_div"：贪心 max-min 多样性选择——第 1 个点取得分
                 最高的，后续每个点选 "得分 + div_lambda * (与已选集合的
                 最小特征距离)" 最大的，避免 G 个远程点全落在同一特征
-                方向（独立 top-k 的冗余问题）。
+                方向（独立 top-k 的冗余问题）；
+                "random"：RP1 论文的随机选择基线——在候选并集 cand_idx
+                （分块阶段已排除局部邻居）中随机采样 G 个，不用距离打分；
+                "spatial_uniform"：RP1 论文最好的 cheap selector——把
+                x,y ∈ [0,1] 均分为 grid_size×grid_size 网格（grid_size =
+                ceil(√G)，G=16 时 4×4=16 格正好每格 1 点），每个网格内
+                随机选 1 个候选点，按随机网格访问序凑够 G 个（非空网格
+                不足时随机补齐），在原始空间而非特征空间保证覆盖均匀。
             div_lambda: 多样性项权重（仅 selector_mode="greedy_div" 时有效）。
                 为 0 时贪心退化为逐个 argmax，等价于 top-k 排序结果，
                 完全回退原行为。
@@ -193,9 +207,9 @@ class RemoteSelector(nn.Module):
         # RP1 空间新颖性选择器（消融实验）
         self.use_rp1_selector = use_rp1_selector
         self.rp1_lambda = rp1_lambda
-        # 贪心多样性选择器（greedy_div）
-        assert selector_mode in ("topk", "greedy_div"), \
-            f"selector_mode must be 'topk' or 'greedy_div', got {selector_mode}"
+        # 远程点选择模式：topk / greedy_div / random / spatial_uniform
+        assert selector_mode in ("topk", "greedy_div", "random", "spatial_uniform"), \
+            f"selector_mode must be one of 'topk'/'greedy_div'/'random'/'spatial_uniform', got {selector_mode}"
         self.selector_mode = selector_mode
         self.div_lambda = div_lambda
         if use_hyperbolic:
@@ -309,6 +323,62 @@ class RemoteSelector(nn.Module):
         return (cand_dist * mask - 1e9 * (1 - mask)).topk(
             G, dim=-1, largest=True)[1]
 
+    @staticmethod
+    def _spatial_uniform_select(cand_idx: torch.Tensor, all_xyz: torch.Tensor,
+                                G: int) -> torch.Tensor:
+        """spatial_uniform：原始 x,y 空间均匀网格采样（RP1 论文最好的 cheap selector）。
+
+        把 x,y ∈ [0,1] 均分为 grid_size × grid_size 网格（grid_size =
+        ceil(√G)，如 G=16 → 4×4=16 格正好每格 1 点），每个网格内从候选
+        并集中随机选 1 个点（如果该格有候选），按随机网格访问序依次收集
+        直到凑够 G 个；非空网格不足 G 个时用随机候选补齐。
+
+        与 random 模式一样不打分、不计算 cand_dist，直接在候选并集
+        （分块阶段已排除局部邻居）上操作，避免物化 [B, S, N] 大张量；
+        候选并集本身逐中心点不同（块内随机采样逐 (b,s) 独立），因此
+        各中心点的网格采样结果自然不同。
+
+        Args:
+            cand_idx: [B, S, M] 候选并集索引
+            all_xyz: [B, N, 3] 全部点的空间坐标（x, y, t）
+            G: 需要选取的点数
+        Returns:
+            remote_idx: [B, S, G] 选中的远程邻居索引（未排序，调用方排序）
+        """
+        B, S, M = cand_idx.shape
+        grid_size = math.ceil(math.sqrt(G))
+        n_cells = grid_size * grid_size
+        cand_xyz = index_points(all_xyz, cand_idx)  # [B, S, M, 3]
+        # 网格编号 cell_x * grid_size + cell_y ∈ [0, n_cells)。
+        # 坐标应已归一化到 [0,1]，clamp 兜底防乘 grid_size 后越界
+        eps = 1e-6
+        cell_x = (cand_xyz[..., 0].clamp(0.0, 1.0 - eps) * grid_size).long()
+        cell_y = (cand_xyz[..., 1].clamp(0.0, 1.0 - eps) * grid_size).long()
+        cell = cell_x * grid_size + cell_y              # [B, S, M]
+        rand = torch.rand(B, S, M, device=cand_idx.device)  # 每个候选的随机分数
+        # 把"逐格收集 + 不足补齐"编码为单次 topk 的优先级分数：
+        #   网格赢家 ∈ (1, 2]，网格访问序越早优先级越高（2 - seq/n_cells）
+        #   其余候选 = rand ∈ [0, 1)，作非空网格不足 G 时的随机补齐池
+        priority = rand.clone()
+        # 网格访问顺序随机化（"直到凑够 G 个"时先访问哪些格是随机的）
+        cell_order = torch.randperm(n_cells, device=cand_idx.device)
+        for seq, j in enumerate(cell_order.tolist()):
+            in_cell = (cell == j)                        # [B, S, M]
+            if not in_cell.any():
+                continue  # 该格全 batch 无候选，跳过
+            # 格内随机分数最大的候选为赢家（该格为空的 (b,s) 处 argmax
+            # 无意义，下面用 has 屏蔽不写入）
+            winner = rand.masked_fill(~in_cell, float("-inf")).argmax(-1)  # [B, S]
+            has = in_cell.any(-1)                        # [B, S] 该中心点在此格是否有候选
+            win_priority = 2.0 - seq / n_cells           # ∈ (1, 2]，seq 越小越优先
+            old = priority.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+            priority.scatter_(
+                -1, winner.unsqueeze(-1),
+                torch.where(has, torch.full_like(old, win_priority), old).unsqueeze(-1))
+        # 先取各网格赢家（按随机格序），非空网格不足 G 时自动用随机候选补齐
+        final = priority.topk(G, dim=-1)[1]              # [B, S, G]
+        return torch.gather(cand_idx, -1, final)
+
     def forward(self, centroid_feat: torch.Tensor, all_feat: torch.Tensor,
                 local_idx: torch.Tensor,
                 global_anchor: torch.Tensor | None = None,
@@ -321,7 +391,8 @@ class RemoteSelector(nn.Module):
             global_anchor: [B, S, C] 或 None。全局吸收节点特征（PVAG 启发）；
                 非 None 时混合距离 = 到中心点距离 + anchor_lambda * 到锚点距离。
             all_xyz: [B, N, 3] 或 None。全部点的空间坐标（x, y, t），
-                仅 use_rp1_selector=True 时用于计算空间新颖性（RP1）。
+                仅 use_rp1_selector=True 时用于计算空间新颖性（RP1），
+                或 selector_mode="spatial_uniform" 时用于 x,y 网格采样。
         Returns:
             remote_idx: [B, S, G] 远程邻居索引（沿 G 维升序）
         """
@@ -333,6 +404,9 @@ class RemoteSelector(nn.Module):
                 f"N={N} 不足以同时容纳 K={local_idx.shape[-1]} 局部邻居与 G={G} 远程邻居")
         if self.use_rp1_selector and all_xyz is None:
             raise ValueError("use_rp1_selector=True 时 forward 需要传入 all_xyz（[B, N, 3] 空间坐标）")
+        if self.selector_mode == "spatial_uniform" and all_xyz is None:
+            raise ValueError(
+                'selector_mode="spatial_uniform" 时 forward 需要传入 all_xyz（[B, N, 3] 空间坐标）')
         # RP1：预取各中心点局部邻居的空间坐标 [B, S, K, 3]，供空间新颖性计算复用
         if self.use_rp1_selector:
             local_xyz = index_points(all_xyz, local_idx)  # [B, S, K, 3]
@@ -348,6 +422,16 @@ class RemoteSelector(nn.Module):
                 c = end - start
                 # 尾块可能不足 G 个元素：块内取 min(G, c) 个，不足则整块全作候选
                 k = min(G, c)
+                if self.selector_mode in ("random", "spatial_uniform"):
+                    # random / spatial_uniform（RP1 cheap selector）：不打分，
+                    # 块内直接随机采样 k 个非局部候选（随机打分 top-k 等价
+                    # 无放回均匀采样，_exclude_local 把本块内局部邻居置
+                    # -inf），省掉块内特征距离计算；候选并集即为逐 (b,s)
+                    # 独立的近似均匀随机子集（每点入选概率 ≈ G/(N-K)）
+                    chunk_rand = torch.rand(B, S, c, device=all_feat.device)
+                    chunk_rand = self._exclude_local(chunk_rand, local_idx, start)
+                    topk_list.append(chunk_rand.topk(k, dim=-1)[1] + start)
+                    continue
                 if self.use_hyperbolic:
                     chunk_dist = self._hyp_dist_chunk(
                         centroid_feat, all_feat[:, start:end, :])
@@ -371,7 +455,25 @@ class RemoteSelector(nn.Module):
                 # largest=True：选特征距离最远的 G 个（排除项已是 -inf 不会被选中）
                 topk_list.append(chunk_dist.topk(k, dim=-1, largest=True)[1] + start)
             cand_idx = torch.cat(topk_list, dim=-1)  # [B, S, n_chunks*G]
-            # 候选并集上重算距离，取全局 top-G
+            if self.selector_mode == "random":
+                # random（RP1 随机基线）：候选并集（分块阶段已随机收集并
+                # 排除局部邻居）中随机选 G 个，不打分、不算 cand_dist。
+                # 极端情形（尾块 c<G+K）下 -inf 排除项可能被块内 topk 带
+                # 入 cand_idx，成员检测剔除，保证远程点与局部邻居不重叠
+                M = cand_idx.shape[-1]
+                rand = torch.rand(B, S, M, device=cand_idx.device)
+                is_local = (cand_idx.unsqueeze(-1)
+                            == local_idx.unsqueeze(-2)).any(-1)      # [B, S, M]
+                rand = rand.masked_fill(is_local, float("-inf"))
+                final = rand.topk(G, dim=-1)[1]                      # [B, S, G]
+                remote_idx = torch.gather(cand_idx, -1, final)
+                return remote_idx.sort(dim=-1)[0]
+            if self.selector_mode == "spatial_uniform":
+                # spatial_uniform（RP1 最好的 cheap selector）：x,y 空间
+                # 均匀网格采样，同样不打分、不算 cand_dist
+                return self._spatial_uniform_select(
+                    cand_idx, all_xyz, G).sort(dim=-1)[0]
+            # 候选并集上重算距离，取全局 top-G（topk / greedy_div 原有逻辑）
             cand_points = index_points(all_feat, cand_idx)  # [B, S, n_chunks*G, C]
             if self.use_hyperbolic:
                 # 双曲距离：按 batch*group 展平后批量计算，再恢复形状
@@ -773,7 +875,9 @@ class LocalRemoteGrouper(nn.Module):
                 False 时行为与原版完全一致。
             rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
             selector_mode: 远程点选择策略 "topk"（原版）/ "greedy_div"
-                （贪心 max-min 多样性选择，见 RemoteSelector）
+                （贪心 max-min 多样性选择）/ "random"（候选并集随机采样，
+                RP1 论文随机基线）/ "spatial_uniform"（x,y 均匀网格采样，
+                RP1 论文最好的 cheap selector），详见 RemoteSelector
             div_lambda: 多样性项权重（仅 selector_mode="greedy_div" 时有效）
             remote_gate: 是否启用远程分支门控融合（SECNet 启发的 gated fusion）。
                 True 时 gate = sigmoid(MLP([remote_feat, centroid_feat]))，
