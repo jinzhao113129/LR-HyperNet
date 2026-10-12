@@ -1,0 +1,22 @@
+<h2>八、每日阅读记录</h2>
+<h3>2026-10-10（周六）· 10 篇</h3>
+<p><b>必看（3 篇，直接用于新架构）</b></p>
+<ul>
+<li><b>SpikingPointMamba</b>（2504.14371）：point-based + Mamba，事件点云的状态空间建模。看点：Mamba 选择性扫描如何处理事件点云的时空局部性，对远程聚合有参考价值。</li>
+<li><b>TTPOINT</b>（2308.09993，ACM MM 2023）：张量化点云网络，用 tensor train 压缩点云特征。看点：四大 point-based 方法之一，局部结构处理方式。</li>
+<li><b>Event2Vec</b>（2504.15371）：把事件投影到向量空间，保留时空因果关系。看点：事件表示方式，可能启发输入编码层设计。</li>
+</ul>
+<p><b>重点（3 篇，数据集 SOTA，决定冲哪个数据集）</b></p>
+<ul>
+<li><b>NGN</b>（2608.17394）：CIFAR10-DVS <b>87.35%</b>（全范式 SOTA），N-Caltech101 84.04%。看点：Noisy group neurons + synchronous resetting，CIFAR10-DVS 是最该冲的数据集（point-based 仅 SECNet 75.7%，差 11.6 点）。</li>
+<li><b>EIS-HAR</b>（2605.20680，CVPR 2026）：DailyDVS-200 <b>51.99%</b>（200 类，point-based 零结果）。看点：point-based 完全空白的数据集，冲上去就是新 SOTA。</li>
+<li><b>SpikePool-B</b>（2510.12102）：N-Caltech101 <b>85.01%</b>（from-scratch SNN SOTA），池化注意力。看点：主场数据集最强对手，注意力机制可借鉴。</li>
+</ul>
+<p><b>选读（4 篇，方法启发）</b></p>
+<ul>
+<li><b>SSLA</b>（2603.06228，ECCV 2026）：稀疏线性注意力，事件检测。看点：线性注意力可能替代远程聚合，降低复杂度。</li>
+<li><b>HoloEvNet</b>（2602.04182）：全息嵌入 + 全局频谱门控。看点：频谱门控与 SECNet 的 FFT 融合有关联。</li>
+<li><b>EventMG</b>（NeurIPS 2025）：事件图 + 多级 Mamba，范式最接近的对手。看点：事件建图 + Mamba 结合方式。</li>
+<li><b>HyperbolicPointCloudCL</b>（2025）：双曲空间 + 点云对比学习。看点：双曲点云最新做法，与双曲分支直接相关。</li>
+</ul>
+<p><i>阅读重点：每篇记"哪个模块能搬到 LR-HyperNet 新架构里"，看完每日 meeting 对齐。</i></p>

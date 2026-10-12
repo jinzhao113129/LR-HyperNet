@@ -1,0 +1,67 @@
+<title>HFECNet 方法论：双曲增强的事件点云识别</title>
+
+<h1>1. 问题设定</h1>
+<p>事件相机输出异步事件流，每个事件为四元组：</p>
+<latex>e_i = (x_i, y_i, t_i, p_i), \quad p_i \in \{-1, +1\}</latex>
+<p>其中 (x_i, y_i) 为像素坐标，t_i 为时间戳，p_i 为极性。将时间窗口 ΔT 内的事件聚合为点云 P ∈ R^(N×4)，任务为事件流级分类 P → y ∈ {1, …, C}。</p>
+<p><b>与主流方法的差异</b>：不将事件流按固定频率积分为帧（frame-based，丢失高时间分辨率），而是保留原始点集，在点域建模（point-based）。</p>
+
+<h1>2. 基线：SECNet/FECNet</h1>
+<p>FECNet 为逐点学习的频域网络，记第 i 个 stage 的输入特征为 X_i ∈ R^(B×G_i×K×d_i)（G_i 组、每组 K=24 个邻居点、特征维 d_i），其流水线为：</p>
+<latex>X_i \xrightarrow{\text{FPS+KNN}} X_i \xrightarrow{\mathcal{F}_{\text{spa}}} \text{GELU} \xrightarrow{\text{Attn}} \mathbb{R}^{B \times G_i \times d_{i+1}} \xrightarrow{\mathcal{F}_{\text{tme}}} \text{Linear2Layer}</latex>
+<ul>
+  <li><b>分组</b>：Farthest Point Sampling 选 G_i 个质心，KNN 聚 K 个邻居；</li>
+  <li><b>空间频域滤波</b> F_spa：沿邻居维做可学习权重的 FFT 滤波（实/虚通道自适应）；</li>
+  <li><b>聚合</b>：欧氏注意力打分 A(X) = softmax(W·X) 后加权求和（bmm）；</li>
+  <li><b>时间频域滤波</b> F_tme：沿组维 FFT + 残差线性层。</li>
+</ul>
+<p>全局池化 cat(mean, max) 后接 MLP 分类头。</p>
+
+<h1>3. 双曲增强：HFECNet</h1>
+<p><b>核心替换</b>：将每个 stage 的欧氏注意力聚合替换为<b>双曲组内聚合</b>，其余结构（嵌入、分组、双曲 FFT、分类头）与基线逐参数一致，保证公平对比。</p>
+
+<h2>3.1 庞加莱双曲空间</h2>
+<p>Poincaré ball：D_c^d = { z ∈ R^d : c‖z‖² &lt; 1 }，c &gt; 0 为曲率。定义原点锚定的指数/对数映射与双曲距离：</p>
+<latex>\exp_0(v) = \tanh\!\Big(\tfrac{\sqrt{c}\,\|v\|}{2}\Big)\frac{v}{\sqrt{c}\,\|v\|}, \qquad \log_0(y) = \frac{2}{\sqrt{c}}\operatorname{arctanh}\!\big(\sqrt{c}\,\|y\|\big)\frac{y}{\|y\|}</latex>
+<latex>d_c(x,y) = \frac{1}{\sqrt{c}}\operatorname{arccosh}\!\Big( 1 + 2c\,\frac{\|x-y\|^2}{(1-c\|x\|^2)(1-c\|y\|^2)} \Big)</latex>
+<p>所有算子均做数值保护（‖·‖ 下界、arctanh 定义域截断、投影回球内），保证前反向数值稳定。</p>
+
+<h2>3.2 双曲组内聚合器（HyperbolicGroupAggregator）</h2>
+<p>输入 X ∈ R^(BG×K×d)，输出 R^(BG×d)，五步：</p>
+<ol>
+  <li><b>指数映射</b>：X_D = exp_0(X)，将欧氏特征嵌入双曲空间；</li>
+  <li><b>锚点</b>：组内欧氏质心经指数映射 μ = exp_0((1/K)·Σ_k X_k)；</li>
+  <li><b>双曲距离注意力</b>：以双曲距离度量组内点与质心的层级关系，
+  <latex>\alpha_k = \operatorname{softmax}_k\!\Big(-\tfrac{d_c(\mu,\, X_{\mathbb{D},k})}{\tau}\Big)</latex></li>
+  <li><b>Möbius 线性变换</b>：在切空间做线性变换后映射回双曲（等价于 W ⊗_c X ⊕_c b）：
+  <latex>Z_k = \exp_0\big( W\,\log_0(X_{\mathbb{D},k}) + b \big)</latex></li>
+  <li><b>切空间加权聚合 + 回欧氏</b>：
+  <latex>g = \exp_0\!\Big( \textstyle\sum_k \alpha_k\, \log_0(Z_k) \Big), \qquad \hat{g} = \mathrm{LN}\big( W_{\text{out}}\, \log_0(g) + \tfrac{1}{K}\textstyle\sum_k X_k \big)</latex></li>
+</ol>
+<p><b>动机</b>：事件点云的局部结构呈部件-整体的层级/树状拓扑；双曲空间的负曲率几何具备树状结构的低失真嵌入能力，比欧氏空间更适合编码这种层级关系，同时保留注意力聚合的可微分性。</p>
+
+<h2>3.3 可学习曲率</h2>
+<p>曲率 c = |ĉ| + ε（ĉ 为可学习参数，保证 c &gt; 0 且初值恰为指定值 c_0 = 0.4），随训练自适应调整双曲空间曲率。</p>
+
+<h1>4. 消融设计（隔离单一变量）</h1>
+<table>
+<colgroup><col width="180" /><col width="340" /><col width="300" /></colgroup>
+<thead>
+<tr><th><p>模式</p></th><th><p>操作</p></th><th><p>隔离的变量</p></th></tr>
+</thead>
+<tbody>
+<tr><td><p>none</p></td><td><p>完整双曲聚合（质心锚点 + 可学习曲率）</p></td><td><p>—</p></td></tr>
+<tr><td><p>no_hyperbolic</p></td><td><p>退化为欧氏注意力聚合（同 FECNet 聚合步）</p></td><td><p>双曲几何本身</p></td></tr>
+<tr><td><p>fixed_curvature</p></td><td><p>曲率固定 c = 1.0，不学习</p></td><td><p>曲率自适应学习</p></td></tr>
+<tr><td><p>no_centroid</p></td><td><p>锚点取组内首个点</p></td><td><p>质心锚点设计</p></td></tr>
+</tbody>
+</table>
+
+<h1>5. 训练协议（与基线逐参数对齐）</h1>
+<ul>
+  <li><b>数据</b>：N-Caltech101 原始事件流，每视频 3 时间窗口（35–65 / 135–165 / 235–265 ms），窗口内均匀下采样至 N = 10240 点，80/20 划分（固定 seed）；</li>
+  <li><b>优化</b>：SGD，lr = 10⁻³，momentum = 0.9，weight decay = 10⁻⁴，CosineAnnealing，350 epochs；</li>
+  <li><b>损失</b>：label smoothing 交叉熵（ε = 0.2）；</li>
+  <li><b>正则</b>：grad norm clip（max = 5.0）；</li>
+  <li><b>评估</b>：窗口级 Top-1 acc + 视频级多数投票 acc（按 mark 分组）。</li>
+</ul>
