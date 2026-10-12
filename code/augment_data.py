@@ -21,7 +21,8 @@
 import numpy as np
 
 
-def random_crop(points: np.ndarray, crop_ratio: float = 0.8) -> np.ndarray:
+def random_crop(points: np.ndarray, rng: np.random.Generator,
+                crop_ratio: float = 0.8) -> np.ndarray:
     """时间维随机裁剪：随机选一个起点，保留 crop_ratio 长度的事件。
 
     模拟官方 300ms 视频切 30ms 滑窗的思路（裁剪后时间戳需重新归一化）。
@@ -29,6 +30,7 @@ def random_crop(points: np.ndarray, crop_ratio: float = 0.8) -> np.ndarray:
     Args:
         points: [N, 4] (t,x,y,p)，t ∈ [0,1]
         crop_ratio: 保留比例
+        rng: 随机数生成器（由调用方传入，保证种子可控）
     Returns:
         [N', 4] 裁剪后的事件
     """
@@ -37,7 +39,7 @@ def random_crop(points: np.ndarray, crop_ratio: float = 0.8) -> np.ndarray:
     # 按时间排序后随机切一段
     order = np.argsort(points[:, 0])
     sorted_pts = points[order]
-    start = np.random.randint(0, n - keep + 1)
+    start = rng.integers(0, n - keep + 1)
     cropped = sorted_pts[start:start + keep].copy()
     # 重新归一化时间到 [0,1]
     t = cropped[:, 0]
@@ -63,18 +65,20 @@ def polarity_flip(points: np.ndarray) -> np.ndarray:
     return out
 
 
-def time_jitter(points: np.ndarray, jitter_std: float = 0.02) -> np.ndarray:
+def time_jitter(points: np.ndarray, rng: np.random.Generator,
+                jitter_std: float = 0.02) -> np.ndarray:
     """时间抖动：t += N(0, jitter_std)，clip 到 [0,1]。"""
     out = points.copy()
-    out[:, 0] = np.clip(out[:, 0] + np.random.normal(0, jitter_std, len(out)), 0, 1)
+    out[:, 0] = np.clip(out[:, 0] + rng.normal(0, jitter_std, len(out)), 0, 1)
     return out
 
 
-def point_dropout(points: np.ndarray, drop_ratio: float = 0.1) -> np.ndarray:
+def point_dropout(points: np.ndarray, rng: np.random.Generator,
+                  drop_ratio: float = 0.1) -> np.ndarray:
     """随机丢弃 10% 点。"""
     n = len(points)
     keep = int(n * (1 - drop_ratio))
-    idx = np.random.choice(n, keep, replace=False)
+    idx = rng.choice(n, keep, replace=False)
     return points[idx]
 
 
@@ -90,15 +94,15 @@ def augment_sample(points: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     aug = rng.choice(5, size=rng.integers(2, 4), replace=False)
     for a in aug:
         if a == 0:
-            points = random_crop(points)
+            points = random_crop(points, rng=rng)
         elif a == 1:
             points = reverse_t(points)
         elif a == 2:
             points = polarity_flip(points)
         elif a == 3:
-            points = time_jitter(points)
+            points = time_jitter(points, rng=rng)
         else:
-            points = point_dropout(points)
+            points = point_dropout(points, rng=rng)
     return points
 
 
@@ -125,8 +129,8 @@ def augment_train_data(data: np.ndarray, label: np.ndarray, mark: np.ndarray,
             # 增强可能改变点数（crop/dropout），重采样回 target_points
             if aug.shape[0] != target_points:
                 n = aug.shape[0]
-                idx = np.random.choice(n, target_points, replace=True) if n < target_points \
-                    else np.random.choice(n, target_points, replace=False)
+                idx = rng.choice(n, target_points, replace=True) if n < target_points \
+                    else rng.choice(n, target_points, replace=False)
                 aug = aug[idx]
             aug_list.append(aug)
         versions.append(np.stack(aug_list))
@@ -140,14 +144,18 @@ def augment_train_data(data: np.ndarray, label: np.ndarray, mark: np.ndarray,
 if __name__ == "__main__":
     """快速自检"""
     rng = np.random.default_rng(0)
-    dummy = np.random.rand(100, 4).astype(np.float32)
+    dummy = rng.random((100, 4)).astype(np.float32)
     dummy[:, 0] = np.sort(dummy[:, 0])  # 时间有序
     dummy[:, 3] = np.where(dummy[:, 3] > 0.5, 1.0, -1.0)  # 极性 ±1
 
     for name, fn in [("random_crop", random_crop), ("reverse_t", reverse_t),
                      ("polarity_flip", polarity_flip), ("time_jitter", time_jitter),
                      ("point_dropout", point_dropout)]:
-        out = fn(dummy)
+        # 含随机性的增强必须传 rng（确定性；不依赖全局 np.random）
+        if name in ("random_crop", "time_jitter", "point_dropout"):
+            out = fn(dummy, rng=rng)
+        else:
+            out = fn(dummy)
         assert out.shape[-1] == 4, f"{name}: shape {out.shape}"
         assert np.isfinite(out).all(), f"{name}: NaN/Inf"
         if name == "polarity_flip":
@@ -156,8 +164,8 @@ if __name__ == "__main__":
             assert out[:, 0].min() >= 0 and out[:, 0].max() <= 1, "时间越界"
         print(f"  {name}: {tuple(out.shape)} ✓")
 
-    # 端到端
-    data = np.random.rand(16, 10240, 4).astype(np.float32)
+    # 端到端（rng=42 内部种子，可复现）
+    data = rng.random((16, 10240, 4)).astype(np.float32)
     label = np.arange(16).reshape(-1, 1)
     mark = np.arange(16)
     d, l, m = augment_train_data(data, label, mark, n_versions=2)

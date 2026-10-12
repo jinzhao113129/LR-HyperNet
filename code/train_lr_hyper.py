@@ -64,6 +64,11 @@ def parse_args():
     parser.add_argument('--use_hyperbolic_selector', action='store_true', default=False,
                         help='双曲距离选16个远程点（学长建议）：RemoteSelector 中先 exp map 到双曲空间，'
                              '再用双曲距离代替欧氏距离选远程邻居。配合 --hyperbolic_type lorentz 使用')
+    parser.add_argument('--use_rp1_selector', action='store_true', default=False,
+                        help='RP1 空间新颖性远程选择器（消融实验）：远程选择得分 = '
+                             '特征距离 + rp1_lambda * 候选点与局部邻居的最小空间欧氏距离')
+    parser.add_argument('--rp1_lambda', type=float, default=1.0,
+                        help='RP1 空间新颖性权重（仅 --use_rp1_selector 时有效）')
     parser.add_argument('--sanity_5class', action='store_true', default=False,
                         help='5-class subset overfit sanity check (Task B): filter label<5 samples '
                              'from train/test h5, num_category forced to 5, epoch capped at 50, '
@@ -164,6 +169,9 @@ def train(net, trainloader, optimizer, criterion, device, args, curvature_init=0
     start_time = time.time()
     # v3.1 曲率优化三件套之二：曲率正则化系数（防止曲率偏离初始值过远）
     curvature_reg_lambda = 0.01
+    # 径向约束损失：remote_agg 前向缓存的 last_radial_pen，按 epoch 求均值记日志
+    radial_pen_sum = 0.0
+    radial_steps = 0
     # 梯度累积步数：0/1 视为关闭（不加 flag 时与原逻辑逐字节一致）
     accum = args.grad_accum if getattr(args, 'grad_accum', 0) and args.grad_accum > 1 else 1
     num_batches = len(trainloader)
@@ -183,6 +191,13 @@ def train(net, trainloader, optimizer, criterion, device, args, curvature_init=0
             if 'curvature' in name:
                 curvature_reg = curvature_reg + (p - curvature_init) ** 2
         loss = loss + curvature_reg_lambda * curvature_reg
+        # 径向约束损失：模型 forward 时在 remote_agg.last_radial_pen 缓存的惩罚项，
+        # 存在且非 None 时加权并入总损失（旧模型无该属性则自动跳过，行为不变）
+        radial_pen = getattr(getattr(net, 'remote_agg', None), 'last_radial_pen', None)
+        if radial_pen is not None:
+            loss = loss + 0.01 * radial_pen
+            radial_pen_sum += radial_pen.item()
+            radial_steps += 1
         # NaN/Inf 防护：loss 异常时跳过该 step（双曲运算数值风险兜底）
         # 累积模式下连带丢弃本窗口已累积的梯度（宁可少更新也不带入脏梯度）
         if not torch.isfinite(loss):
@@ -219,7 +234,8 @@ def train(net, trainloader, optimizer, criterion, device, args, curvature_init=0
         print(f"[warn] epoch skipped {nan_skipped} non-finite steps")
 
     return {"loss": avg_loss, "acc": acc, "time": elapsed, "nan_skipped": nan_skipped,
-            "true": train_true, "pred": train_pred}
+            "true": train_true, "pred": train_pred,
+            "radial_pen": (radial_pen_sum / radial_steps) if radial_steps > 0 else None}
 
 
 def validate(net, testloader, criterion, device, mark_test, args):
@@ -341,11 +357,25 @@ def main(args):
     # 当 num_point 小于原始点数时，reshape 会把每个样本拆成多个片段，
     # 标签/mark 需相应重复对齐（与 train_hfecnet.py 一致）
     if current_data_test.shape[0] != current_label_test.shape[0]:
-        rep = current_data_test.shape[0] // current_label_test.shape[0]
-        current_label_test = current_label_test.repeat_interleave(rep)
+        n_seg = current_data_test.shape[0]
+        rep = n_seg // current_label_test.shape[0]
+        rem = n_seg % current_label_test.shape[0]
+        # repeat_interleave(rep) 同样有余数截断：尾部点数不足 num_point 的
+        # 片段归属最后一个原始样本，补 label[-1]，与下方 mark 对齐逻辑一致
+        current_label_test = torch.cat([
+            current_label_test.repeat_interleave(rep),
+            current_label_test[-1:].repeat(rem),
+        ])
     if current_data_test.shape[0] != len(current_mark_test):
-        rep = current_data_test.shape[0] // len(current_mark_test)
-        current_mark_test = np.repeat(current_mark_test, rep)
+        n_seg = current_data_test.shape[0]
+        rep = n_seg // len(current_mark_test)
+        rem = n_seg % len(current_mark_test)
+        # rep 重复后若有余数（尾部样本点数不足 num_point 的片段），
+        # 余下片段归属最后一个原始样本，补 mark[-1]，避免 mark 长度不足/错位
+        current_mark_test = np.concatenate([
+            np.repeat(current_mark_test, rep),
+            np.repeat(current_mark_test[-1:], rem),
+        ])
     # 任务 B：5 类子集过滤（label<5）。在 reshape/label 对齐之后过滤，
     # 保证 data/label/mark 三者按同一 mask 筛选（对重复展开的样本同样成立）
     if args.sanity_5class:
@@ -366,8 +396,15 @@ def main(args):
     current_label_sum = torch.from_numpy(current_label_sum.astype('int64'))
     current_data_sum = current_data_sum.reshape(-1, args.num_point, 4)
     if current_data_sum.shape[0] != current_label_sum.shape[0]:
-        rep = current_data_sum.shape[0] // current_label_sum.shape[0]
-        current_label_sum = current_label_sum.repeat_interleave(rep)
+        n_seg = current_data_sum.shape[0]
+        rep = n_seg // current_label_sum.shape[0]
+        rem = n_seg % current_label_sum.shape[0]
+        # 同 test：repeat_interleave(rep) 的余数截断需补 label[-1]，
+        # 避免尾部片段 label 长度不足导致 TensorDataset 对齐错位
+        current_label_sum = torch.cat([
+            current_label_sum.repeat_interleave(rep),
+            current_label_sum[-1:].repeat(rem),
+        ])
     # 任务 B：训练集同样按 label<5 过滤，并把类数/轮数限制为 sanity 协议
     if args.sanity_5class:
         labels_np = current_label_sum.numpy() if isinstance(current_label_sum, torch.Tensor) \
@@ -382,9 +419,9 @@ def main(args):
     # 数据增强（--augment N）：每个训练样本再生成 N 个增强版本（随机crop/时间反转/极性翻转/抖动/丢点）
     if args.augment > 0:
         from augment_data import augment_train_data
-        data_np = current_data_sum.numpy()
-        label_np = current_label_sum.numpy()
-        mark_np = current_mark_sum.numpy() if isinstance(current_mark_sum, np.ndarray) else np.asarray(current_mark_sum)
+        data_np = np.asarray(current_data_sum)
+        label_np = np.asarray(current_label_sum)
+        mark_np = np.asarray(current_mark_sum)
         current_data_sum, current_label_sum, current_mark_sum = augment_train_data(
             data_np, label_np, mark_np, n_versions=args.augment)
         current_data_sum = torch.from_numpy(current_data_sum.astype('float32'))
@@ -419,11 +456,15 @@ def main(args):
                             hyperbolic_classifier=args.hyperbolic_classifier,
                             use_group_norm=args.group_norm,
                             use_hyperbolic_selector=args.use_hyperbolic_selector,
-                            remote_dropout=args.remote_dropout)
+                            remote_dropout=args.remote_dropout,
+                            use_rp1_selector=args.use_rp1_selector,
+                            rp1_lambda=args.rp1_lambda)
     log_string('Model: LRHyperNet (remote_g=%d, curvature_init=%s, time_enc=%s, kda=%s, '
-               'kda_bidirectional=%s, use_global_anchor=%s, anchor_lambda=%s, hyperbolic_type=%s)' % (
+               'kda_bidirectional=%s, use_global_anchor=%s, anchor_lambda=%s, hyperbolic_type=%s, '
+               'use_rp1_selector=%s, rp1_lambda=%s)' % (
                    args.remote_g, args.curvature_init, args.time_enc, args.kda,
-                   args.kda_bidirectional, args.use_global_anchor, args.anchor_lambda, args.hyperbolic_type))
+                   args.kda_bidirectional, args.use_global_anchor, args.anchor_lambda,
+                   args.hyperbolic_type, args.use_rp1_selector, args.rp1_lambda))
     criterion = cal_loss
     classifier.apply(inplace_relu)
     device = 'cpu' if args.use_cpu else 'cuda'
@@ -528,6 +569,9 @@ def main(args):
         writer.add_scalar('Accuracy/train', train_out["acc"], epoch)
         log_string('Train Accuracy: %f' % (train_out["acc"]))
         print(f"Training loss:{train_out['loss']} acc:{train_out['acc']}% time:{train_out['time']}s")
+        if train_out.get("radial_pen") is not None:
+            writer.add_scalar('RadialPenalty/train', train_out["radial_pen"], epoch)
+            print(f"Radial Penalty: {train_out['radial_pen']}")
 
         test_out = validate(classifier, testDataLoader, criterion, device, current_mark_test, args)
         # best 按 test_acc_seq（视频级多数投票）判定，与基线一致

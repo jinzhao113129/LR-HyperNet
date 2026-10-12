@@ -12,6 +12,8 @@ Local+Remote 邻域分组模块（LR-HyperNet 核心组件）
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -148,7 +150,9 @@ class RemoteSelector(nn.Module):
                  anchor_lambda: float = 0.5,
                  use_hyperbolic: bool = False,
                  curvature_init: float = 0.4,
-                 hyperbolic_type: str = "lorentz"):
+                 hyperbolic_type: str = "lorentz",
+                 use_rp1_selector: bool = False,
+                 rp1_lambda: float = 1.0):
         """
         Args:
             remote_g: 每个中心点选取的远程邻居数 G
@@ -161,6 +165,12 @@ class RemoteSelector(nn.Module):
                 True 时先 exp map 到双曲空间，再用双曲距离代替欧氏距离。
             curvature_init: 双曲曲率初始值（仅 use_hyperbolic=True 时有效）
             hyperbolic_type: "poincare" 或 "lorentz"（仅 use_hyperbolic=True 时有效）
+            use_rp1_selector: 是否启用 RP1 空间新颖性选择器（消融实验）。
+                True 时远程选择得分 = 特征距离 + rp1_lambda * 空间新颖性
+                （空间新颖性 = 候选点与局部邻居的最小欧氏距离），
+                即优先选"特征不相似且空间位置新颖"的远程点（RP1 论文：
+                Oracle 68% vs 简单 KNN 61%）。False 时保持原行为不变。
+            rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
         """
         super().__init__()
         self.remote_g = remote_g
@@ -169,6 +179,9 @@ class RemoteSelector(nn.Module):
         self.use_hyperbolic = use_hyperbolic
         self.curvature_init = curvature_init
         self.hyperbolic_type = hyperbolic_type.lower()
+        # RP1 空间新颖性选择器（消融实验）
+        self.use_rp1_selector = use_rp1_selector
+        self.rp1_lambda = rp1_lambda
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
@@ -214,9 +227,36 @@ class RemoteSelector(nn.Module):
         padded.scatter_(2, safe_idx, float("-inf"))
         return padded[..., :c]
 
+    @staticmethod
+    def _spatial_novelty(cand_xyz: torch.Tensor, local_xyz: torch.Tensor) -> torch.Tensor:
+        """RP1 空间新颖性：候选点与局部邻居集合的最小欧氏距离。
+
+        空间新颖性大 = 候选点在空间上离已覆盖的局部邻域远（位置新颖），
+        与特征距离互补：既"特征不相似"又"空间位置新颖"的点才是好的远程点。
+
+        Args:
+            cand_xyz: [B, S, M, 3] 或 [B, 1, M, 3] 候选点空间坐标（x, y, t）
+                （chunk 路径下 S 维为 1，靠广播对齐每个中心点的邻居）
+            local_xyz: [B, S, K, 3] 各中心点局部邻居的空间坐标
+        Returns:
+            novelty: [B, S, M] 每个候选点到该中心点局部邻居的最小欧氏距离
+
+        显存优化：逐个局部邻居计算 [B, S, M] 距离并滚动取 min，
+        避免一次性物化 [B, S, M, K] 的完整距离张量（与分块 top-k 同思路）。
+        """
+        K = local_xyz.shape[2]
+        min_sq = None
+        for k in range(K):
+            # [B, S, M, 3] 广播相减后按坐标维求平方和 → [B, S, M]
+            d = ((cand_xyz - local_xyz[:, :, k:k + 1, :]) ** 2).sum(-1)
+            min_sq = d if min_sq is None else torch.minimum(min_sq, d)
+        # 开方得到欧氏距离（加 eps 防 0 距离时梯度/数值问题）
+        return torch.sqrt(min_sq + 1e-12)
+
     def forward(self, centroid_feat: torch.Tensor, all_feat: torch.Tensor,
                 local_idx: torch.Tensor,
-                global_anchor: torch.Tensor | None = None) -> torch.Tensor:
+                global_anchor: torch.Tensor | None = None,
+                all_xyz: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             centroid_feat: [B, S, C] 中心点特征
@@ -224,6 +264,8 @@ class RemoteSelector(nn.Module):
             local_idx: [B, S, K] 局部邻居索引（待排除）
             global_anchor: [B, S, C] 或 None。全局吸收节点特征（PVAG 启发）；
                 非 None 时混合距离 = 到中心点距离 + anchor_lambda * 到锚点距离。
+            all_xyz: [B, N, 3] 或 None。全部点的空间坐标（x, y, t），
+                仅 use_rp1_selector=True 时用于计算空间新颖性（RP1）。
         Returns:
             remote_idx: [B, S, G] 远程邻居索引（沿 G 维升序）
         """
@@ -233,6 +275,11 @@ class RemoteSelector(nn.Module):
         if N < G + local_idx.shape[-1]:
             raise ValueError(
                 f"N={N} 不足以同时容纳 K={local_idx.shape[-1]} 局部邻居与 G={G} 远程邻居")
+        if self.use_rp1_selector and all_xyz is None:
+            raise ValueError("use_rp1_selector=True 时 forward 需要传入 all_xyz（[B, N, 3] 空间坐标）")
+        # RP1：预取各中心点局部邻居的空间坐标 [B, S, K, 3]，供空间新颖性计算复用
+        if self.use_rp1_selector:
+            local_xyz = index_points(all_xyz, local_idx)  # [B, S, K, 3]
         # 全局锚点扩展为 [B, S, C]（可学习单向量 -> 广播到每个中心点）
         if global_anchor is not None:
             if global_anchor.dim() == 1:
@@ -250,6 +297,12 @@ class RemoteSelector(nn.Module):
                         centroid_feat, all_feat[:, start:end, :])
                 else:
                     chunk_dist = square_distance(centroid_feat, all_feat[:, start:end, :])
+                if self.use_rp1_selector:
+                    # RP1 空间新颖性：块内候选点 [B, 1, c, 3]（广播）与局部邻居的
+                    # 最小欧氏距离 [B, S, c]，加到特征距离上作为选择得分
+                    chunk_novelty = self._spatial_novelty(
+                        all_xyz[:, start:end, :].unsqueeze(1), local_xyz)  # [B, S, c]
+                    chunk_dist = chunk_dist + self.rp1_lambda * chunk_novelty
                 if global_anchor is not None:
                     # PVAG 式全局吸收：混合"到中心点"与"到全局锚点"的距离
                     if self.use_hyperbolic:
@@ -274,6 +327,11 @@ class RemoteSelector(nn.Module):
                 ).reshape(Bc, Sc, Nc)
             else:
                 cand_dist = ((cand_points - centroid_feat.unsqueeze(-2)) ** 2).sum(-1)
+            if self.use_rp1_selector:
+                # RP1：候选并集上同样加上空间新颖性，保持与块内一致的得分定义
+                cand_xyz = index_points(all_xyz, cand_idx)      # [B, S, n_chunks*G, 3]
+                cand_dist = cand_dist + self.rp1_lambda * self._spatial_novelty(
+                    cand_xyz, local_xyz)
             if global_anchor is not None:
                 if self.use_hyperbolic:
                     Bc, Sc, Nc, Cc = cand_points.shape
@@ -306,6 +364,12 @@ class KDACausalEncoder(nn.Module):
 
     显存控制：状态为低维 [B, S, D, D]（D=16），K=24 步循环更新，峰值
     ~ O(B·S·D²)；输出投影回 channel 维，与 LocalGrouper 下游维度对齐。
+
+    数值稳定性（v3.2，修复反向梯度爆炸 NaN）：
+      - key L2 归一化：保证 (I - β k kᵀ) 为收缩映射，BPTT 梯度有界
+        （未归一化时 24 步反传按 |1-β‖k‖²|^K 指数爆炸）
+      - α 先 clamp logit 再 exp：避免 exp 溢出 inf 后 clamp 反传 0*inf=NaN
+      - 状态范数截断 detach 且只降不升：梯度不走 1/norm² 路径
     """
 
     def __init__(self, channel: int, state_dim: int = 16, bidirectional: bool = False):
@@ -361,7 +425,11 @@ class KDACausalEncoder(nn.Module):
             state = state * alphai.unsqueeze(-1) \
                 - betai.unsqueeze(-1) * torch.einsum('bsi,bsj->bsij', ki, kS) \
                 + betai.unsqueeze(-1) * torch.einsum('bsi,bsj->bsij', ki, vi)
-            state_norm = state.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            # 状态范数截断（防前向漂移）。v3.2 修复：
+            #   - norm 下界 1.0：只降尺度不放大（旧版 min=1e-6 会产生 ~5e7 缩放系数）
+            #   - norm detach：范数只是数值稳定器，梯度不应流经 1/norm² 路径
+            #     （旧版 norm 参与反传，配合极大状态有 inf*0 → NaN 风险）
+            state_norm = state.norm(dim=(-2, -1), keepdim=True).clamp(min=1.0).detach()
             state = state * torch.clamp(50.0 / state_norm, max=1.0)
             outs.append(torch.einsum('bsji,bsj->bsi', state, qi))
         return torch.stack(outs, dim=2)  # [B, S, K, D]
@@ -381,8 +449,16 @@ class KDACausalEncoder(nn.Module):
         k = self.k_proj(x_sorted)                              # [B, S, K, D]
         v = self.v_proj(x_sorted)
         q = self.q_proj(x_sorted)
+        # v3.2 修复（反向梯度爆炸根因）：key L2 归一化（DeltaNet/KDA 标准做法）。
+        # 递推对状态的雅可比含 (I - β k kᵀ)，其沿 k 的特征值为 1-β‖k‖²。
+        # 未归一化时 ‖k‖²>2/β 即模长>1，K=24 步 BPTT 梯度按 |1-β‖k‖²|^K
+        # 指数放大直至 inf→NaN；归一化后特征值 ∈ [1-β, 1]，收缩映射，梯度有界。
+        k = F.normalize(k, dim=-1)
         beta = torch.sigmoid(self.beta_proj(x_sorted)).clamp(max=0.5)
-        alpha = torch.exp(self.alpha_proj(x_sorted)).clamp(min=0.05, max=1.0)
+        # v3.2 修复：先 clamp logit 再 exp。旧版 exp→inf 后 clamp 反传 0*inf=NaN；
+        # clamp 到 (-∞, 0] 保证 exp ∈ (0, 1]，下界 log(0.05) 等价旧版 min=0.05
+        alpha = torch.exp(
+            self.alpha_proj(x_sorted).clamp(min=math.log(0.05), max=0.0))
         # 3. 前向因果扫描（时间正序）
         out_fwd = self._causal_scan(k, v, q, beta, alpha)     # [B, S, K, D]
         if self.bidirectional:
@@ -436,6 +512,9 @@ class HyperbolicRemoteAggregator(nn.Module):
         self.mobius_bias = nn.Parameter(torch.zeros(hidden_size))
         self.out_proj = nn.Linear(hidden_size, hidden_size)
         self.layer_norm = nn.LayerNorm(hidden_size)
+        # Lorentz 径向约束正则（lorentz 分支每次 _aggregate 后更新，供训练循环加到 loss）
+        self.radial_radius = 4.0  # R_t
+        self.last_radial_pen = None
 
     def _curvature(self) -> torch.Tensor:
         """曲率需为正，用 abs+eps 保证（curvature_init=0.4 时实际曲率≈0.4）。"""
@@ -487,6 +566,12 @@ class HyperbolicRemoteAggregator(nn.Module):
             # 映射回 Lorentz 再回到欧氏
             agg_hyp = lorentz_exp_origin(agg_tangent, c)  # [M, C+1]
             agg_euclidean = lorentz_log_origin(agg_hyp, c)  # [M, C]
+            # Lorentz 径向约束：限制切空间表示的范数不超过 R_t，
+            # 超出部分二次惩罚（hinge^2），防止切向量漂移过远导致数值不稳
+            R_t = self.radial_radius
+            pen_x = F.relu(x_tangent.norm(dim=-1) - R_t) ** 2  # [M, K]
+            pen_agg = F.relu(agg_tangent.norm(dim=-1) - R_t) ** 2  # [M]
+            self.last_radial_pen = (pen_x.mean() + pen_agg.mean()) / 2
         # 输出投影 + 残差 + LayerNorm（残差保证梯度流畅）
         out = self.out_proj(agg_euclidean)
         residual = x.mean(dim=1)
@@ -579,7 +664,10 @@ class LocalRemoteGrouper(nn.Module):
                  kda: bool = False, kda_bidirectional: bool = False,
                  hyperbolic_type: str = "poincare",
                  use_hyperbolic_selector: bool = False,
-                 remote_dropout: float = 0.0, **kwargs):
+                 remote_dropout: float = 0.0,
+                 remote_stochastic_depth: float = 0.1,
+                 use_rp1_selector: bool = False,
+                 rp1_lambda: float = 1.0, **kwargs):
         """
         Args:
             channel: 输入特征维度 C
@@ -601,6 +689,15 @@ class LocalRemoteGrouper(nn.Module):
             hyperbolic_type: "poincare"（庞加莱球，原版）或 "lorentz"
                 （洛伦兹模型，v3.1 新增，消除边界梯度尖峰）
             remote_dropout: 远程聚合输出后的 dropout 概率（缓解双曲过拟合）
+            remote_stochastic_depth: 远程聚合支路 stochastic depth 概率
+                p_drop（训练时逐样本以该概率跳过双曲远程聚合，直接用组均值
+                残差代替；推理时不跳过。0 关闭）
+            use_rp1_selector: RP1 空间新颖性远程选择器（消融实验）。
+                True 时远程选择得分 = 特征距离 + rp1_lambda * 空间新颖性
+                （候选点与局部邻居的最小空间欧氏距离，RP1 论文：结合
+                spatial novelty 的选择器优于纯特征距离 top-k）。
+                False 时行为与原版完全一致。
+            rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
         """
         super().__init__()
         self.groups = groups
@@ -623,7 +720,9 @@ class LocalRemoteGrouper(nn.Module):
                                               anchor_lambda=anchor_lambda,
                                               use_hyperbolic=use_hyperbolic_selector,
                                               curvature_init=curvature_init,
-                                              hyperbolic_type=hyperbolic_type)
+                                              hyperbolic_type=hyperbolic_type,
+                                              use_rp1_selector=use_rp1_selector,
+                                              rp1_lambda=rp1_lambda)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
         else:
@@ -635,6 +734,8 @@ class LocalRemoteGrouper(nn.Module):
             self.global_anchor = nn.Parameter(torch.zeros(channel))
         # 远程聚合输出 dropout（缓解双曲过拟合）
         self.remote_dropout = nn.Dropout(remote_dropout)
+        # 远程聚合支路 stochastic depth 概率（训练时生效）
+        self.remote_stochastic_depth = remote_stochastic_depth
 
     def _knn_idx(self, new_points: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
         """分块 KNN（与原 LocalGrouper 的显存优化实现完全一致）。
@@ -702,9 +803,26 @@ class LocalRemoteGrouper(nn.Module):
         anchor = None
         if self.use_global_anchor:
             anchor = self.global_anchor  # [C]，RemoteSelector 内部广播到 [B,S,C]
-        remote_idx = self.remote_selector(centroid_feat, points, idx, anchor)  # [B, S, G]
+        # xytp[..., 0:3]（x, y, t 空间坐标）传给 RemoteSelector，
+        # 仅 use_rp1_selector=True 时用于计算空间新颖性；否则被忽略，行为不变
+        remote_idx = self.remote_selector(centroid_feat, points, idx, anchor,
+                                          xytp[:, :, 0:3])  # [B, S, G]
         remote_points = index_points(points, remote_idx)               # [B, S, G, C]
-        remote_feat = self.hyper_agg(remote_points)                    # [B, S, C]
+        # ---- stochastic depth：训练时以 p_drop 概率逐样本跳过双曲远程聚合支路 ----
+        # 展平为 [M, G, C]（M = B*S，每个 FPS 组独立伯努利），跳过的组直接用
+        # 残差 x.mean(dim=1)（组均值）代替 hyper_agg 输出；推理（self.training=False）
+        # 时不跳过。keep mask [M,1] 与 [M,C] 广播。
+        p_drop = self.remote_stochastic_depth
+        if self.training and p_drop > 0.0:
+            G, Cc = remote_points.shape[2], remote_points.shape[3]
+            M = B * S
+            flat = remote_points.reshape(M, G, Cc)                     # [M, G, C]
+            agg = self.hyper_agg(flat.unsqueeze(1)).squeeze(1)         # [M, C]
+            residual = flat.mean(dim=1)                                # [M, C]
+            keep = (torch.rand(M, 1, device=flat.device, dtype=flat.dtype) > p_drop)
+            remote_feat = torch.where(keep, agg, residual).reshape(B, S, -1)  # [B, S, C]
+        else:
+            remote_feat = self.hyper_agg(remote_points)                # [B, S, C]
         remote_feat = self.remote_dropout(remote_feat)
         if self.use_global_anchor:
             # 全局吸收节点注入（PVAG 思路，保证可导）：

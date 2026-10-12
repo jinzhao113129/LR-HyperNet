@@ -41,7 +41,9 @@ class LRHyperNet(nn.Module):
                  use_group_norm: bool = False,
                  hyperbolic_classifier: bool = False,
                  use_hyperbolic_selector: bool = False,
-                 remote_dropout: float = 0.0):
+                 remote_dropout: float = 0.0,
+                 use_rp1_selector: bool = False,
+                 rp1_lambda: float = 1.0):
         """
         Args:
             num_classes: 分类数（N-Caltech101 为 101）
@@ -76,6 +78,12 @@ class LRHyperNet(nn.Module):
                 RemoteSelector 中先 exp map 到双曲空间，再用双曲距离
                 代替欧氏距离选远程邻居。与 hyperbolic_type 配合使用
                 （lorentz 推荐，数值更稳定）。
+            use_rp1_selector: RP1 空间新颖性远程选择器（消融实验）。
+                True 时远程选择得分 = 特征距离 + rp1_lambda * 空间新颖性
+                （候选点与局部邻居的最小空间欧氏距离，RP1 论文：结合
+                spatial novelty 的选择器优于纯特征距离 top-k，
+                Oracle 68% vs 简单 KNN 61%）。False 时行为与原版完全一致。
+            rp1_lambda: 空间新颖性权重（仅 use_rp1_selector=True 时有效）
         """
         super().__init__()
         if time_enc and kda:
@@ -114,7 +122,9 @@ class LRHyperNet(nn.Module):
                 kda=kda, kda_bidirectional=kda_bidirectional,
                 hyperbolic_type=hyperbolic_type,
                 use_hyperbolic_selector=use_hyperbolic_selector,
-                                      remote_dropout=remote_dropout)
+                remote_dropout=remote_dropout,
+                use_rp1_selector=use_rp1_selector,
+                rp1_lambda=rp1_lambda)
             self.local_grouper_list.append(local_grouper)
             aggregation = Attention(self.feature_list[i + 1])
             self.aggregation_list.append(aggregation)
