@@ -92,6 +92,8 @@ def parse_args():
     parser.add_argument('--logit_adj', type=float, default=0.0,
                         help='logit-adjusted CE 的 tau（b8 修复：loss = CE(logits + tau*log(prior))，'
                              'prior 为训练集类占比；0 = 关闭，常用 1.0）')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='random seed for reproducibility')
     parser.add_argument('--augment', type=int, default=0,
                         help='训练数据增强版本数（0=关闭；2=每样本再生成2个增强版本，数据×3）')
     return parser.parse_args()
@@ -315,6 +317,17 @@ def main(args):
     def log_string(str):
         logger.info(str)
         print(str)
+
+    '''SET SEED'''
+    seed = getattr(args, 'seed', 42)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
     '''CREATE DIR'''
     timestr = str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M'))
