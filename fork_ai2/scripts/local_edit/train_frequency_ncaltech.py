@@ -19,9 +19,12 @@ from torch.utils.tensorboard import SummaryWriter
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" 
+# GPU 选择：默认映射到可见的第一块（无 SLURM/GPU 绑定时 = 卡0）。
+# lease/Slurm 环境已通过 CUDA_VISIBLE_DEVICES 只暴露租约内的卡，
+# 这里再设 "0" 会覆盖错卡——仅在外部未设置时才兜底设 0。
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
