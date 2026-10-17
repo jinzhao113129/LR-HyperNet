@@ -1,0 +1,23 @@
+You are reviewing a research analysis and a code change for the SECNet hyperbolic-ablation project on this HPC. Working dir: /home/jnguan/JiangYouxin/ZhaoJin
+
+# Context
+- Baseline SECNet (event point cloud classification on N-Caltech101, ~47-48% acc in our 10240-point single-window protocol) contains a LEARNABLE per-dimension scale "fps_parameter" (t,x,y,p 4 dims) applied to xytp BEFORE furthest_point_sample, in every LocalGrouper. It drifts from 1.0 during baseline training (e.g. x reaches ~1.64x). This is original SECNet design: see models/modules.py, LocalGrouper.forward, the line `xytp = self.fps_parameter * xytp` before furthest_point_sample (and SECNet_official/ copy line 104/122 for the original).
+- "hsel_bug" = a run with --hyperbolic_selector where the hyperbolic-grid remote-point selection used SCALED coordinates (the same fps_parameter-scaled xytp that flows into the rest of the net). It scored +4.71pp over baseline (McNemar p=0.0002).
+- "RP1 fix" = the grid selection uses RAW x,y (before scaling), +2.46pp (p=0.0398).
+- A 2x2 matrix (grid geometry Euclidean vs Hyperbolic) x (selection coordinates raw vs scaled) is proposed with a new narrative: "hyperbolic grids are naturally robust to coordinate-scale distortion".
+
+# Your tasks
+1. Read /tmp/a1_analysis.md (the full analysis note, in Chinese).
+2. Read the relevant code yourself to verify the claims: models/modules.py LocalGrouper.forward (fps_parameter usage), the hyperbolic selector implementation (search for hyperbolic / RP1 / spatial_uniform in models/), models/FECNet.py flag wiring.
+3. Review the --freeze_fps_parameter change in train_frequency_ncaltech.py (backup: train_frequency_ncaltech.py.bak_ai2_20261014). Check: (a) correctness of freezing AFTER inplace_relu but BEFORE optimizer construction; (b) whether SGD/AdamW branches both respect it; (c) any edge case (DDP find_unused_parameters, param groups, checkpoint save/load) that could break; (d) whether the control experiment "baseline + freeze" cleanly isolates the fps_parameter contribution.
+4. Critique the 2x2 attribution: is "hyperbolic grid robust to scale distortion" a sound claim from only 3 runs (baseline, rp1_fix, hsel_bug)? What confounds remain (e.g. interaction with downstream scaled features, trainability, FPS stochasticity ~0.5-0.9pp)? What additional cheap experiment would most strengthen or falsify it?
+5. Check the extract_preds.py fixes (FLAG_KEYS + per-round reseeding; backup tools/extract_preds.py.bak_ai2_20261014). Confirm the reseed logic makes (log_dir, which, eval_seed) uniquely determine predictions.
+
+Write your review to /tmp/ai2_review_20261014.md in Chinese (with code refs). Structure: 结论摘要 (verdict per task, CONFIRMED/ISSUE FOUND/PARTIAL), then details. Be adversarial and specific — cite file:line for every claim. Do not modify any code; this is read-only review.
+
+Files to read:
+- /tmp/a1_analysis.md
+- models/modules.py (LocalGrouper, hyperbolic selector)
+- models/FECNet.py (flag wiring)
+- train_frequency_ncaltech.py (vs backup .bak_ai2_20261014)
+- tools/extract_preds.py (vs backup tools/extract_preds.py.bak_ai2_20261014)

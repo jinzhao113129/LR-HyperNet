@@ -54,3 +54,13 @@ Thumbs.db
 
 # HPC 备份
 __hpc_latest/
+
+# 2026-10-17 补：大体积目录不进 git
+SECNet/
+outputs/
+docs/_pdf_render/
+*.pdf
+*.zip
+fork_ai2/papers/
+*.pyc
+*.tmp

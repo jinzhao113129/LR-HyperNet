@@ -110,6 +110,12 @@ def augment_train_data(data: np.ndarray, label: np.ndarray, mark: np.ndarray,
                        n_versions: int = 3) -> tuple:
     """扩充训练数据：每个样本生成 n_versions 个增强版本。
 
+    2026-10-17 OOM 修复（177160/177161 双双 OOM 实测）：原版持有
+    versions 列表（n+1 份完整副本）+ np.concatenate 再复制 → 峰值
+    ~4×数据（augment 2 时 ~72GB，任何 --mem 都扛不住）。改为**预分配
+    单数组流式填充**：峰值 = 输出数组（(1+n)×数据）+ 单样本临时副本，
+    augment 2 时 ~31GB + 数 MB，64G --mem 充裕。
+
     Args:
         data: [N, 10240, 4] float32
         label: [N, 1] 或 [N] int
@@ -121,9 +127,19 @@ def augment_train_data(data: np.ndarray, label: np.ndarray, mark: np.ndarray,
     rng = np.random.default_rng(42)
     N = len(data)
     target_points = data.shape[1]
-    versions = [data]  # 原样
-    for _ in range(n_versions):
-        aug_list = []
+    n_total = N * (n_versions + 1)
+    # 预分配输出（唯一的大数组）；块布局与原版 np.concatenate 一致：
+    # [原样 N | 增强0 N | 增强1 N | ...]——label/mark 的 tile 顺序、
+    # DataLoader shuffle 后语义不变，且 rng 消耗顺序与原版逐次一致
+    # （同种子下增强内容不变，可复现性保持）。
+    data_aug = np.empty((n_total, target_points, data.shape[2]),
+                        dtype=data.dtype)
+    data_aug[:N] = data  # 原样块
+    label = np.squeeze(label)
+    label_aug = np.tile(label, n_versions + 1)
+    mark_aug = np.tile(mark, n_versions + 1)
+    for v in range(n_versions):
+        base = (v + 1) * N
         for i in range(N):
             aug = augment_sample(data[i], rng)
             # 增强可能改变点数（crop/dropout），重采样回 target_points
@@ -132,12 +148,7 @@ def augment_train_data(data: np.ndarray, label: np.ndarray, mark: np.ndarray,
                 idx = rng.choice(n, target_points, replace=True) if n < target_points \
                     else rng.choice(n, target_points, replace=False)
                 aug = aug[idx]
-            aug_list.append(aug)
-        versions.append(np.stack(aug_list))
-    data_aug = np.concatenate(versions, axis=0)  # [N*(1+n), 10240, 4]
-    label = np.squeeze(label)
-    label_aug = np.tile(label, n_versions + 1)
-    mark_aug = np.tile(mark, n_versions + 1)
+            data_aug[base + i] = aug
     return data_aug, label_aug, mark_aug
 
 

@@ -1,0 +1,31 @@
+You are reviewing recent code changes on this HPC for the SECNet hyperbolic-ablation project. Working dir: /home/jnguan/JiangYouxin/ZhaoJin. This is a READ-ONLY review: do not modify any file. Write your review in Chinese as your final reply (it will be captured to a file). Cite file:line for every claim. Be adversarial and specific.
+
+# What changed recently (all by "ai2", 2026-10-14). Diffs are vs the .bak backups.
+
+## Change 1: --hsel_scaled_coords flag (most recent, 4 files)
+Purpose: the old "buggy" hyperbolic-grid selection (which used fps_parameter-SCALED coordinates, +4.71pp on seed42) became unreproducible after fix-B (selection now uses raw coords). This flag makes both behaviors explicitly controllable for a 2x2 (grid geometry x coord convention) cross-seed study.
+- models/FECNet.py: HyperbolicUniformGrouper gained __init__(use_scaled_coords=False) passing *args/**kwargs to LocalGrouper; forward computes xytp_original = xytp; xytp = fps_parameter * xytp; sel_xytp = xytp if self.use_scaled_coords else xytp_original. FECNet.__init__ gained use_hsel_scaled_coords param with no-op warning when hyperbolic_selector is off; instantiation passes use_scaled_coords=use_hsel_scaled_coords.
+- train_frequency_ncaltech.py: new --hsel_scaled_coords argparse flag; passed to FECNet; resume-consistency key list now includes hyperbolic_mlp/scale_norm_fps/hsel_scaled_coords.
+- tools/extract_preds.py: FLAG_KEYS + defaults dict + FECNet(...) call all handle hsel_scaled_coords.
+Review focus: (a) does the flag truly reproduce the OLD buggy code path (compare with git-free reference: the old behavior was "hyperbolic grid on scaled xytp"), especially the ordering of scale-multiply vs grid call and clamp behavior; (b) state_dict / checkpoint compat (flag adds no params — verify); (c) extract_preds rebuild correctness for a checkpoint trained WITH the flag (saved_args from checkpoint 'args' vs from log file — check parse_flags_from_log regex \bkey=True\b still works for the new key); (d) any path where use_scaled_coords is silently ignored.
+
+## Change 2: --freeze_fps_parameter (train script only)
+Freezes all params whose name contains 'fps_parameter' (requires_grad_(False)) after inplace_relu, before optimizer construction. Claim to verify: the params still enter AdamW param groups but grad is None so they are skipped; final fps_parameter should remain exactly 1.0. Check both SGD and AdamW branches, DDP find_unused_parameters interplay if relevant, and whether checkpoint save/load preserves this.
+
+## Change 3: tools/extract_preds.py two earlier fixes
+(1) FLAG_KEYS/build_model gained hyperbolic_mlp, scale_norm_fps (+ now hsel_scaled_coords) — previously missing flags made scale_norm infer at 2.57% (model rebuilt with wrong forward path). (2) extract_one() re-seeds torch/np/random at its start so (log_dir, which, eval_seed) uniquely determines predictions (previously --which both let the last checkpoint's randint consume RNG before best ran). Verify the reseed logic placement and that 'last' results are unchanged vs history.
+
+# Files to read (current vs backup):
+- models/FECNet.py vs models/FECNet.py.bak_ai2_20261014b
+- models/modules.py vs models/modules.py.bak_ai2_20261014 (docstring-only change; also read LocalGrouper.forward to check fps_parameter usage)
+- train_frequency_ncaltech.py vs train_frequency_ncaltech.py.bak_ai2_20261014
+- tools/extract_preds.py vs tools/extract_preds.py.bak_ai2_20261014b
+- models/local_remote_grouper.py (lorentz helpers, for context)
+
+# Output format (in Chinese):
+## 结论摘要
+Per change: CONFIRMED correct / ISSUE FOUND (severity high|med|low) / PARTIAL — one line each.
+## 详细发现
+Numbered findings, each with file:line, what's wrong or verified, and a concrete failure scenario if it's a bug.
+## 建议的最小修复
+Only if issues found.
