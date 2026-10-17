@@ -88,22 +88,42 @@ do_setup() {
     ls -la train.h5 test.h5
   fi
 
-  echo "=== [3/4] Python 环境（venv，不动系统 conda） ==="
-  if [ -x "$PY" ]; then
-    echo "venv 已存在，跳过"
+  echo "=== [3/4] Python 环境（venv + pip，不动系统 conda） ==="
+  if [ -x "$PY" ] && "$PY" -m pip --version >/dev/null 2>&1; then
+    echo "venv+pip 已就绪"
   else
-    python3 -m venv ~/zhaojin/venv
-    "$PY" -m pip install --upgrade pip
-    # torch 2.3.1+cu121（3090 = sm_86，cu121 支持）+ 依赖（import 清单实测）
-    "$PY" -m pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
-    "$PY" -m pip install "numpy<2" h5py scikit-learn tensorboard
+    # 本节点实测：Debian 无 python3-venv 包 → ensurepip 缺失，venv 建成半成品
+    # （python 可用、无 pip；装 python3-venv 需要 sudo，不可行）。
+    # 对策 = get-pip.py 引导（零 delete：不重建目录，直接往现有 venv 装 pip）。
+    [ -x "$PY" ] || python3 -m venv --without-pip ~/zhaojin/venv
+    mkdir -p ~/zhaojin/tmp
+    for i in 1 2 3; do
+      curl -sSL -m 300 https://bootstrap.pypa.io/get-pip.py -o ~/zhaojin/tmp/get-pip.py && break
+      echo "get-pip 下载失败（第 $i 次），重试..."; sleep 5
+    done
+    "$PY" ~/zhaojin/tmp/get-pip.py
   fi
+  # 依赖安装（无条件执行：pip 见已装即跳过，幂等，setup 重跑安全）
+  # torch 2.3.1+cu121（3090 = sm_86）+ import 清单实测依赖
+  "$PY" -m pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+  "$PY" -m pip install "numpy<2" h5py scikit-learn tensorboard
 
-  echo "=== [4/4] 编译自检 ==="
+  echo "=== [4/4] 编译 + import + GPU 自检 ==="
   cd "$WORK"
   "$PY" -m py_compile tools/train_frequency_ncaltech.py models/FECNet.py \
     models/modules.py models/local_remote_grouper.py provider_data.py augment_data.py \
     && echo COMPILE_OK
+  # 真实 import 冒烟（py_compile 只查语法不查依赖；这里全链 import + CUDA）
+  PYTHONPATH="$WORK:$WORK/models" "$PY" -c "
+import torch, h5py, sklearn, numpy, provider_data, augment_data
+from models.FECNet import FECNet
+ok = torch.cuda.is_available()
+print('IMPORT_OK torch=%s cuda=%s%s' % (torch.__version__, ok,
+      (' gpu=%s' % torch.cuda.get_device_name(0)) if ok else '（!!跑链前必须解决）'))
+"
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<未设置>}"
+  nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu --format=csv,noheader
+  df -h ~/zhaojin | tail -1
 
   echo "=== setup 完成 ==="
   echo "下一步：bash run_3090_setup_and_run.sh chain"
