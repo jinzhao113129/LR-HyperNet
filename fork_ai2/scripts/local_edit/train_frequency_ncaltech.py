@@ -143,6 +143,16 @@ def parse_args():
                              'best/last 判定仍用非 EMA 权重（不污染组件对照）；EMA '
                              '作为并行出口，推理时按需选用（通常 +0.5~1.5pp，小数据'
                              '集更稳）。2026-10-17 用户决策：跑之前的工作做到极致。')
+    parser.add_argument('--patience', type=int, default=0,
+                        help='收敛早停（2026-10-17 用户决策：小样本快测协议——'
+                             '"满轮数=只要收敛就立刻停"）。>0 时连续 N 个 epoch '
+                             'best_test_seq 无提升则正常退出（checkpoint 已保，'
+                             '配对差用 best）。0=关闭（跑满 args.epoch，全量默认）。'
+                             '判定口径与 best 一致（test_acc_seq），避免双口径。')
+    parser.add_argument('--early_stop_metric', type=str, default='seq',
+                        choices=['seq', 'acc'],
+                        help='早停判据：seq=test_acc_seq（默认，与 best 判定一致）；'
+                             'acc=test acc。仅 --patience>0 时生效。')
     return parser.parse_args()
 
 def inplace_relu(m):
@@ -675,7 +685,10 @@ def main(args):
                       'hyperbolic_mlp','scale_norm_fps','hsel_scaled_coords',
                       # Codex P1 修复（2026-10-17）：augment/ema 影响训练数据量
                       # 与 EMA 语义，KDA 式接力误改会静默换实验，必须校验
-                      'augment','ema']:
+                      'augment','ema',
+                      # Codex 快测复审（2026-10-17）：patience/early_stop_metric
+                      # 决定停止协议，接力误改会静默改变实验终止条件
+                      'patience','early_stop_metric']:
                 if k in saved_args and k in cur_args and saved_args[k] != cur_args[k]:
                     mismatch_keys.append(f"{k}: saved={saved_args[k]} vs current={cur_args[k]}")
             if mismatch_keys:
@@ -740,6 +753,22 @@ def main(args):
             log_string('Segment stop_epoch=%d reached (current epoch %d). '
                        'Exiting normally for chain handover.' % (seg_stop, epoch))
             break
+        # --patience 早停状态初始化/恢复（首个 epoch 前建立基线）：
+        # Codex 快测复审修复：resume 时优先从 checkpoint 恢复早停计数
+        #（防丢历史无提升计数导致提前/延后停）；无存的旧 ckpt 用已恢复的
+        # best 指标初始化（比 -1 稳妥——至少不会把历史最佳当新高估）。
+        if epoch == start_epoch:
+            _restored = (checkpoint or {}).get('_patience_state') or {}
+            if _restored:
+                _best_early_stop = _restored.get('best', -1.0)
+                _epochs_no_improve = _restored.get('no_improve', 0)
+                log_string('EarlyStop state resumed: best=%.4f no_improve=%d'
+                           % (_best_early_stop, _epochs_no_improve))
+            else:
+                _init_best = best_test_seq if args.early_stop_metric == 'seq' \
+                    else best_test_acc
+                _best_early_stop = _init_best if _init_best > 0 else -1.0
+                _epochs_no_improve = 0
         if args.hyperbolic_fusion:
             if epoch < curvature_warmup_epochs:
                 for n, p in classifier.named_parameters():
@@ -805,11 +834,33 @@ def main(args):
             net_ema=(ema.state_dict() if ema is not None else None),
             # P1-3 判据：标记 EMA 更新方案——只有 'step' 方案的 shadow
             # 才在 resume 时恢复（旧 'epoch' 方案的 BN stats 已污染）
-            ema_scheme=('step' if ema is not None else None))
+            ema_scheme=('step' if ema is not None else None),
+            # Codex 快测复审：早停计数随 checkpoint 持久化（resume 不丢历史）
+            _patience_state=({'best': _best_early_stop,
+                              'no_improve': _epochs_no_improve}
+                             if args.patience > 0 else None))
         print(f"Testing loss:{test_out['loss']}  "f"acc:{test_out['acc']}% time:{test_out['time']}s [best test acc: {best_test_acc}%] [best test seq acc: {best_test_seq*100.}%]\n\n")
         log_string('Test Accuracy: %f ' % (test_out["acc"]))
         log_string('Test Accuracy seq: %f' % (test_out["test_acc_seq"]))
         log_string('loss : %f' % train_out["loss"])
+        # --patience 收敛早停（小样本快测协议：满轮数=收敛即停）：
+        # 连续 N 个 epoch best_test_seq 无提升则正常退出。
+        # 判据与 best 判定同口径（test_acc_seq），checkpoint 已保存。
+        if args.patience > 0:
+            metric = test_out["test_acc_seq"] if args.early_stop_metric == 'seq' \
+                else test_out["acc"]
+            if metric > _best_early_stop:
+                _best_early_stop = metric
+                _epochs_no_improve = 0
+            else:
+                _epochs_no_improve += 1
+                log_string('EarlyStop: no improvement for %d/%d epochs'
+                           % (_epochs_no_improve, args.patience))
+            if _epochs_no_improve >= args.patience:
+                log_string('EarlyStop triggered at epoch %d (best %s=%.4f) — '
+                           'converged, exiting normally'
+                           % (epoch + 1, args.early_stop_metric, _best_early_stop))
+                break
     if args.train_method =="DDP":
         dist.destroy_process_group()
     logger.info('End of training...')

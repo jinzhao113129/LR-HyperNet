@@ -1266,3 +1266,97 @@ resume 键、双 extract 重播种、mcnemar --which、ha v2 log_dir、
 - ol-w0 排期 16:08 是调度器预计（此刻 14:57，还没到）；
   ha 链在其后进第 8 坑——今晚进卡的判断不变；
 - NLP2 d_ls0 解码仍排队（等 V100-16 空位）。
+
+---
+
+## 35. 战略转向：小样本快测回归 + 全部排队冲刺链取消（2026-10-17 晚）
+
+### 用户决策
+
+- **取消全部 SECNet 排队冲刺链**（177369 ha v2 / 177370 G16 均 scancel）；
+- **回归"先小样本→正反馈→再全量"协议**（用户原话：像之前那样用少量
+  数据集 + 满轮数测试是否有正反馈）；
+- **满轮数的新定义：收敛即停**（连续无提升立刻退出，不跑满固定 epoch）。
+
+### 新增：--patience 收敛早停（train_frequency_ncaltech.py）
+
+- argparse：--patience N（0=关闭跑满，默认全量行为不变）+
+  --early_stop_metric seq/acc（默认 seq 与 best 判定同口径）；
+- 训练循环：每 epoch 末判定，连续 N 个 epoch 无提升正常 break
+  （checkpoint 已存，配对差用 best）；早停状态在 start_epoch 初始化
+  （resume 兼容）；
+- 语法过，已上传 HPC。
+
+### 小样本快测链 ×2（已提交排队）
+
+- **177622 base**：baidu 3596/934 + patience 20（上限 300ep）+
+  augment 2 + EMA 0.999 + batch 16 + V100-16；
+- **177623 ha**：同 flag + --hyperbolic_attention（配对差 =
+  组件+配方在小样本的净增益方向）；
+- **知情风险记录**：P0 时代曾判小样本为"坏基线"（组件结论不可信）——
+  用户明确回归此协议，定位为**方向性快测**（看配对差方向而非绝对值，
+  正反馈才上全量）。
+
+### NLP2 续训完成 → 解码评估链
+
+- 177390 COMPLETED（4h30m，20ep 终 loss 3.61，从 3.9 降）；
+- 解码+BLEU 作业 177624 已提交（saved_models_cont，--suffix _cont）。
+
+### 队列现状
+
+- lab2 系列（别的项目）+ ol- 在占坑，我们的快测链排队等 V100-16。
+
+---
+
+## 36. Codex 快测复审修复：口径重定 + patience 三点（2026-10-17 20:30）
+
+### Codex 结论：第二档与第三档交界——口径有根本统计矛盾，修后跑
+
+### P0-1 口径修正（采纳全部）
+
+1. **对照口径**：官方 60.60 是**单窗 test acc**——早停/验收从 seq
+   改为 **acc**（两份 sbatch 已改 --early_stop_metric acc）；
+2. **跑同配方基线**：恢复 run_pi_base_baidu_ai2（用户原砍，Codex 指出
+   不跑基线则超 60.60 无法归因）——60.60 降为**外部方向锚**，win/lose
+   判据 = 组件 best acc vs 同配方基线 best acc + McNemar；
+3. **log_dir 改 pi2**（避免与已取消的 pi 旧目录混淆）；
+4. **hsel_scaled 复活声明**：矩阵第 2 条是"旧 bug 口径的方向探针"，
+   与修复版选点分开（新决策，非第一梯队降级的回退）；
+5. 知情记录：934 样本二项噪声半宽 ~3.2pp、单 seed、test-selected
+   best/early-stop——本轮定位是**方向筛选**，不声明"直接赢"。
+
+### P0-2 patience 修复（三点）
+
+- ✅ save 在早停判定前（best/last 完整性 Codex 确认无虞）；
+- **修复**：早停计数持久化进 checkpoint（`_patience_state` 键：
+  best+no_improve），resume 优先恢复；无存的旧 ckpt 用已恢复的
+  best 指标初始化（不再 -1 重建）；
+- **修复**：resume 校验键补 patience/early_stop_metric（接力误改
+  停止协议会报错）；
+- ✅ stop_epoch 开头 / patience 末尾的优先级合理（Codex 确认）。
+
+### 3090 迁移包 v3（Codex 布局采纳）
+
+```
+~/secnet/
+  train_frequency_ncaltech.py  provider_data.py  augment_data.py
+  models/{FECNet.py, modules.py, local_remote_grouper.py}  # local_edit 版
+  tools/extract_preds.py
+  code/analysis/mcnemar_test.py
+  data/{train.h5, test.h5}
+```
+
+- extract_preds.py 必须在 tools/（REPO_ROOT 反推）——Codex 指出
+  平铺会导入错目录；
+- LRHyperNet 线文件暂缺（lr_hypernet.py 改名 g16 版 + 缺
+  extract_preds_lrh.py）——本轮 FECNet 快测不需要，记录为缺口；
+- 环境建议（Codex）：Python 3.10 + torch 2.3.1+cu121 +
+  cudnn-cu12 8.9.x 锁死 + numpy<2 + sklearn/h5py/tensorboard；
+  先 nvidia-smi 确认驱动；
+- 上传后必须 sha256sum + tar tzf + h5py 验形状（不能只靠 HDF 头）。
+
+### 状态
+
+- 快测协议按新口径待跑（6 条：基线 + 5 组件，acc 口径）；
+- 3090 代码包 v3 已重发用户（65KB）；
+- HPC trainer 已同步修复（py_compile 过）。
