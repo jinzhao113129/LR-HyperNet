@@ -1430,9 +1430,12 @@ resume 键、双 extract 重播种、mcnemar --which、ha v2 log_dir、
 
 ### 通道细节（本机 GitHub TLS 抽风对策）
 
-- 本机 git push 连续 TLS 失败（schannel/openssl 均挂）——改走
-  **GitHub REST Contents API**（该通道稳定，109MB 资产上传都成功），
+- 本机 git push 连续 TLS 失败（schannel/openssl 均挂）——代码/文档文件改走
+  **GitHub REST Contents API**（单文件限 100MB，推 .py/.md 稳定），
   两个文件 PUT 上去，远程 blob 与本地逐字节比对一致。
+  （Codex 审查修正 2026-10-18：原文本句曾混写"109MB 资产上传都成功"——
+  109MB 数据包实际走的是 **Releases API**（uploads.github.com 资产端点，
+  2GB 上限），两通道不是一回事。）
 - clone 状态证实：用户 3090 的 `~/zhaojin/pi2_code` 是完整 clone
   （顶层目录与仓库一致）——之前"TLS 瞬断没成功"判断有误，实际
   成功过一次（报错"目录已存在"正是它）。
