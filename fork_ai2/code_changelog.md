@@ -1360,3 +1360,117 @@ resume 键、双 extract 重播种、mcnemar --which、ha v2 log_dir、
 - 快测协议按新口径待跑（6 条：基线 + 5 组件，acc 口径）；
 - 3090 代码包 v3 已重发用户（65KB）；
 - HPC trainer 已同步修复（py_compile 过）。
+
+---
+
+## 37. 3090 平台规矩 + 迁移通道落地（2026-10-17 22:00）
+
+### 学长立的规矩（必须遵守）
+
+1. **只用租约 124**（gpu-server-3 的 3090），不动其他 GPU——越权访问=封号；
+2. **禁 SCP/拖拽上传**：传文件的唯一途径 = GitHub/HuggingFace 上存 + 节点里
+   git clone 拉取——直接 SCP/拖拽会被封号；
+3. **禁一切 delete 类操作**（rm -rf 等）；
+4. **卡 24 小时跑满**（保证利用率）；
+5. **我们所有文件放 ~/zhaojin/**（学长新建，两台 GPU 节点自动同步可见）。
+
+### 迁移落地状态
+
+- 代码已在 **GitHub 主仓库**（jinzhao113129/LR-HyperNet，commit 3b2aa95）：
+  快测修复版 trainer + local_edit 全组件 FECNet + sbatch 脚本——**用户从
+  3090 code-server 终端 git clone 即可获取**（学长指定的合法通道）；
+- **~/zhaojin/pi2/** 已在 HPC 侧建好完整布局（models/tools/code/data）+
+  baidu 数据（train [3596,10240,4] / test [934,10240,4] h5 验证过），
+  并 git init + commit——但 HPC 无 GitHub push 权限（403），此目录作为
+  HPC 侧副本；数据包不上 GitHub（109MB 超合理仓库大小），靠节点间
+  sync 已就位；
+- HPC 登录节点验证：GitHub clone 可达（clone_test 成功后已清理）；
+- **用户侧操作**：进 3090 code-server 终端执行
+  `git clone https://github.com/jinzhao113129/LR-HyperNet.git ~/zhaojin/pi2`
+  （会拿到代码但不含数据；数据已在 ~/zhaojin/pi2/data/ 里，二者合并）；
+- 本地→GitHub 的 push 曾遇 TLS 间歇失败，多次重试后成功——后续如再
+  阻塞可改由用户在自己电脑 push。
+
+### 下一步
+
+- 用户确认 clone 完成后：在 gpu-server-3 终端装环境
+  （Python3.10 + torch 2.3.1+cu121 + cudnn 8.9 + numpy<2），
+  然后 6 条快测链开跑（在 124 的 3090 上串行执行，保持卡满）。
+
+---
+
+## 38. 3090 全链通道打通：数据 Release + 一键脚本 + 租约卡修复（2026-10-18）
+
+### 三个落地件
+
+1. **数据通道（学长规矩的正解）**：baidu 小样本数据包（109MB，
+   train [3596,10240,4] + test [934,10240,4]）发布为 GitHub Release
+   `data-baidu-small`（draft 转正，公开可下）。上传后 sha256 与本地
+   一致（085472b6...9428b），HPC 登录节点实测 URL 可直下（30s 拉了
+   41MB）。**之前"数据靠节点间 sync 到位"的说法是错的**——portal
+   sync/ls 查证 zhaojin 在 3090 平台上是 0 条目，数据实际只在 HPC
+   侧（jnguan 主目录）。Release 是节点侧取数的合规通道。
+
+2. **一键脚本 `fork_ai2/scripts/run_3090_setup_and_run.sh`**（API 推
+   到 main @ 3dcbb98）：
+   - `setup`：组装 ~/zhaojin/pi2 布局（clone 仓库本地复制，不 SCP）+
+     Release 下载数据（sha256 强校验 + 3 次重试）+ venv 环境
+     （torch 2.3.1+cu121、numpy<2、h5py、sklearn、tensorboard）+
+     py_compile 自检；
+   - `chain`：6 条快测链串行执行（base/ha/hsel/spike/rp1/hmlp），
+     幂等（.done 标记跳过已完链）+ 失败链自动重试 resume + 零 delete
+     + 全产物 ~/zhaojin/logs_run/ 与 log/classification/ 下。
+   - 协议锁定：baidu 3596/934 + augment×3 + EMA 0.999 + patience 20
+     （early_stop_metric=acc）+ epoch 300 上限 + seed 42。
+
+3. **trainer 租约卡修复**（main @ 9b8dbf6，本地 commit 6628361）：
+   第 23 行原硬编码 `os.environ["CUDA_VISIBLE_DEVICES"] = "0"`，在
+   租约/Slurm 用 CUDA_VISIBLE_DEVICES 绑卡的机器上会**覆盖成错卡**
+   （越权风险——学长规矩 1）。改为外部未设置时才兜底。py_compile 过。
+
+### 通道细节（本机 GitHub TLS 抽风对策）
+
+- 本机 git push 连续 TLS 失败（schannel/openssl 均挂）——代码/文档文件改走
+  **GitHub REST Contents API**（单文件限 100MB，推 .py/.md 稳定），
+  两个文件 PUT 上去，远程 blob 与本地逐字节比对一致。
+  （Codex 审查修正 2026-10-18：原文本句曾混写"109MB 资产上传都成功"——
+  109MB 数据包实际走的是 **Releases API**（uploads.github.com 资产端点，
+  2GB 上限），两通道不是一回事。）
+- clone 状态证实：用户 3090 的 `~/zhaojin/pi2_code` 是完整 clone
+  （顶层目录与仓库一致）——之前"TLS 瞬断没成功"判断有误，实际
+  成功过一次（报错"目录已存在"正是它）。
+
+### 远程 main 状态
+
+```
+9b8dbf6 fix: CUDA_VISIBLE_DEVICES 租约兼容（外部已设置时不覆盖）
+3dcbb98 feat: 3090 一键脚本（setup+chain 6 链串行）
+3b2aa95 feat: 快测协议 v2 + patience 修复 + 3090 迁移包
+（+ Release data-baidu-small：109MB 数据资产）
+```
+
+### 用户侧下一步（gpu-server-3 code-server 终端）
+
+```bash
+cd ~/zhaojin/pi2_code && git pull   # 拿一键脚本（git 通道，合规）
+bash fork_ai2/scripts/run_3090_setup_and_run.sh setup   # ~20min
+bash fork_ai2/scripts/run_3090_setup_and_run.sh chain   # 6 链串行
+```
+
+本地 git 与远程出现 API-push 造成的分叉（本地 6628361 vs 远程
+9b8dbf6，内容一致提交对象不同）——本地暂不 push，等 TLS 恢复后
+`git pull --rebase` 收敛。
+
+---
+
+## 39. 飞书更新 2026-10-18 版（快测转向 + 3090 全链落地）（2026-10-18）
+
+- feishu_update_20261018.md：接 10-17 版格式（豆包审核后更新的协作
+  约定不变）。内容：战略转向（撤 HPC 冲刺链改 3090 快测的决策依据
+  + 学长五条规矩执行表）、快测协议（60.60 对照口径 + 统一配方 +
+  6 链矩阵 + 统计诚实声明）、3090 迁移落地全表（数据 Release 通道
+  修正记录 + 一键脚本 + 环境自检全绿 + 两个工程修复）、当前状态
+  与下一步、上一版存档锚点（不重复更新项）。
+- NLP2 按用户要求不进飞书（内容只在本地报告）。
+- 本地 git 与远程的 API-push 分叉保留（12aeb7f/c7e4c0e/6628361 vs
+  远程 9c2e728），TLS 恢复后 pull --rebase 收敛。
