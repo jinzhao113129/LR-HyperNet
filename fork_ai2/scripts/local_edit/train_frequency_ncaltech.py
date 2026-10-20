@@ -106,6 +106,26 @@ def parse_args():
                              '双曲激活再 log 回欧氏，然后才做 0.1 残差注入。W/b 零初始化，'
                              '初始输出恒为 0。需与 --hyperbolic_attention 同开才有意义，'
                              '单独开时警告并 no-op')
+    parser.add_argument('--hyperbolic_gate', action='store_true', default=False,
+                        help='双曲距离门控（替换式，共识③ 融合层 gated→双曲加权）：'
+                             '替换 gated fusion 的 global 分支（mean pool->group_conv->'
+                             'sigmoid 逐通道门控），门控信号改由双曲距离学出——每个'
+                             '空间位置（组）的 C 维特征投影到 Lorentz 流形，离全体组'
+                             '质心越近门控越大。门控粒度从逐通道改为逐组/逐空间位置')
+    parser.add_argument('--fca_gate', action='store_true', default=False,
+                        help='频域通道门控（FcaNet 思路，ICCV 2021）：替换 gated fusion'
+                             '的 global 分支（mean pool=最低频 DCT 分量），改用前 4 个'
+                             '低频 DCT 分量压缩每个通道学门控。保留逐通道门控语义。'
+                             '与 --hyperbolic_gate 互斥')
+    parser.add_argument('--hyperbolic_radial', action='store_true', default=False,
+                        help='曲率感知双曲径向校正（PointCHR 思路，arXiv 2607.24052）：'
+                             'embed 后逐点做径向校正——复杂度高的点（离群/精细）投影'
+                             '到双曲边界获得更大容量，复杂度低的点留在中心，残差注入')
+    parser.add_argument('--polar_feature', action='store_true', default=False,
+                        help='方向/半径分离特征层（Polar FC 思路，arXiv 2609.32899）：'
+                             'embed 后把特征分解为方向（单位向量）和半径（标量）分别'
+                             '可学习映射，半径可独立学。是 --hyperbolic_radial 的欧氏'
+                             '对照，两者互斥')
     parser.add_argument('--scale_norm_fps', action='store_true', default=False,
                         help='尺度归一化 FPS（A1 归因发现）：FPS 采样前对 xytp 做 '
                              'per-dimension 标准化 (x-mean)/std，替代可学习 fps_parameter 缩放。'
@@ -569,6 +589,10 @@ def main(args):
                               use_hyperbolic_embedding=args.hyperbolic_embedding,
                               use_hyperbolic_attention=args.hyperbolic_attention,
                               use_hyperbolic_mlp=args.hyperbolic_mlp,
+                              use_hyperbolic_gate=args.hyperbolic_gate,
+                              use_fca_gate=args.fca_gate,
+                              use_hyperbolic_radial=args.hyperbolic_radial,
+                              use_polar_feature=args.polar_feature,
                               use_event_mamba_ssm=args.event_mamba_ssm,
                               use_scale_norm_fps=args.scale_norm_fps,
                               use_hsel_scaled_coords=args.hsel_scaled_coords)
@@ -686,6 +710,9 @@ def main(args):
                       # 2026-10-14 ai2 补：推理工具 FLAG_KEYS 已含此二键，
                       # resume 校验也要覆盖，否则换 flag resume 不报错
                       'hyperbolic_mlp','scale_norm_fps','hsel_scaled_coords',
+                      # 2026-10-18：hyperbolic_gate/fca_gate 增删门控模块 + 替换
+                      # gated fusion forward 路径，换 flag resume 必须报错
+                      'hyperbolic_gate','fca_gate','hyperbolic_radial','polar_feature',
                       # Codex P1 修复（2026-10-17）：augment/ema 影响训练数据量
                       # 与 EMA 语义，KDA 式接力误改会静默换实验，必须校验
                       'augment','ema',

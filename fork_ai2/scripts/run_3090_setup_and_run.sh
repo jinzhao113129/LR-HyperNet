@@ -31,7 +31,8 @@ DATA_SHA256=085472b69c3567d48662151b0c46cf168eda984dfdada9dc217056fe23c9428b
 DATA_URL=https://github.com/jinzhao113129/LR-HyperNet/releases/download/data-baidu-small/baidu_small.tar.gz
 
 # ---- 6 条快测链定义（口径：test acc 单窗对照官方 Table 9 的 60.60）----
-# 协议统一：baidu 3596/934 + augment×3 + EMA 0.999 + patience 20 + epoch 300
+# 协议统一：baidu 3596/934 + augment 3（原样+3增强=数据×4；--augment N 语义
+# 是每样本再生成 N 个增强版本，总数据 ×(1+N)）+ EMA 0.999 + patience 20 + epoch 300
 # 每条链 = 同配方 + 单组件差异。组件说明见 run_pi_ha_baidu_ai2.sh 头注。
 chain_flags() {
   case "$1" in
@@ -41,9 +42,15 @@ chain_flags() {
     spike) echo "--spike_time_enc" ;;
     rp1)  echo "--rp1_selector" ;;
     hmlp) echo "--hyperbolic_attention --hyperbolic_mlp" ;;
+    hgate) echo "--hyperbolic_gate" ;;
+    fca) echo "--fca_gate" ;;
+    chr) echo "--hyperbolic_radial" ;;
+    polar) echo "--polar_feature" ;;
+    hclf) echo "--hyperbolic_classifier" ;;
     *) echo "UNKNOWN_CHAIN"; exit 2 ;;
   esac
 }
+# hgate/fca 已在 chain_flags 定义（融合层③候选），但暂不排入快测 6 链（等 Codex 放行）
 CHAIN_ORDER="base ha hsel spike rp1 hmlp"
 
 # ============================================================================

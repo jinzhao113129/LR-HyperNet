@@ -601,6 +601,249 @@ class HyperbolicAttention(nn.Module):
         return out
 
 
+class HyperbolicGate(nn.Module):
+    """双曲距离门控（替换式，替换 SECNet gated fusion 的通道门控）。
+
+    原 gated fusion（每个 stage 末尾）：
+        x_global = avg_pool(x) -> group_conv -> bn -> expand
+        x = x_local * sigmoid(x_global)   # 逐通道门控，欧氏全局池化+线性学出
+
+    本组件把门控信号的来源换成双曲距离：每个空间位置（组）的 C 维特征投影到
+    Lorentz 流形，计算它离全体组质心的双曲距离，距离近（典型特征）门控大、
+    距离远（离群特征）门控小：
+
+        gate_s = sigmoid(alpha * (r0 - d_hyp(centroid, group_s)))   # [B, S]
+        x      = x_local * gate                                      # 逐组门控
+
+    语义：门控粒度从原「逐通道」（SE 式标量门控）改为「逐组/逐空间位置」。
+    双曲距离是点到点的几何量，对应空间/层级结构（双曲几何的用武之地），
+    而非通道重要性；逐通道标量无法承载双曲几何。保留「local × gate」骨架，
+    只换门控信号来源（替换共识③：融合层 gated→双曲加权）。
+
+    LayerNorm 稳定特征范数；alpha 用 softplus 参数化保证恒正（abs 在 0 点梯度
+    为 0 会卡死 alpha），alpha_raw 初始 log(expm1(0.01)) -> alpha≈0.01、初始
+    gate≈sigmoid(-0.01*dist)≈0.48 中性（对齐原 gated fusion 随机 sigmoid 均值），
+    alpha/bias/曲率/in_proj 均有非零梯度。曲率 softplus 参数化初始 0.4（同
+    HyperbolicAttention 修复C）。
+    """
+
+    def __init__(self, channels: int, hidden_dim: int = 64, curvature_init: float = 0.4):
+        super().__init__()
+        self.channels = channels
+        self.hidden_dim = hidden_dim
+        # 曲率：期望语义 softplus(param)=curvature_init（同 HyperbolicAttention 修复C）
+        c_init = math.log(math.expm1(curvature_init))
+        self.curvature = nn.Parameter(torch.tensor(c_init))
+        # 瓶颈降维 C -> d_h（双曲空间内的全部计算在 d_h 维）
+        self.in_proj = nn.Linear(channels, hidden_dim)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        # 门控 logit = bias - alpha*dist。alpha 用 softplus 参数化保证恒正
+        # （abs() 在 0 点梯度为 0 会卡死 alpha 及整个双曲分支，见 Codex 复审 P0）：
+        # alpha_raw 初始 log(expm1(0.01)) -> alpha=softplus(alpha_raw)=0.01
+        # （小正、梯度非零，初始 gate≈sigmoid(-0.01*dist)≈0.48 中性）
+        self.alpha_raw = nn.Parameter(torch.tensor(math.log(math.expm1(0.01))))
+        self.bias = nn.Parameter(torch.tensor(0.0))
+
+    def _curvature(self) -> torch.Tensor:
+        return F.softplus(self.curvature) + 1e-4
+
+    def forward(self, x_local: torch.Tensor, x_src: torch.Tensor) -> torch.Tensor:
+        """双曲距离门控。
+
+        Args:
+            x_local: [B, C, S] local 分支输出（被门控的对象）
+            x_src:   [B, C, S] 门控特征源（傅里叶时间聚合 + gelu 后、conv 前）
+        Returns:
+            [B, C, S] x_local * gate，gate 为 [B, 1, S] 逐组门控
+        """
+        B, C, S = x_src.shape
+        c = self._curvature()
+        # 每个空间位置 s 的 C 维特征 -> d_h 维瓶颈 -> Lorentz 流形
+        h = self.in_proj(x_src.permute(0, 2, 1))        # [B, S, d_h]
+        h = self.layer_norm(h)
+        h_hyp = lorentz_exp_origin(h, c)                # [B, S, d_h+1]
+        # 全体组的 Lorentz 质心（切空间均值再 exp，同 HyperbolicFusionBranch）
+        centroid_tan = h.mean(dim=1, keepdim=True)      # [B, 1, d_h]
+        centroid = lorentz_exp_origin(centroid_tan, c)  # [B, 1, d_h+1]
+        dist = lorentz_distance(centroid.expand_as(h_hyp), h_hyp, c)  # [B, S]
+        # 离质心越近门控越大（alpha>0，softplus 保证恒正、梯度非零）
+        alpha = F.softplus(self.alpha_raw)
+        gate = torch.sigmoid(self.bias - alpha * dist)  # [B, S]
+        gate = gate.unsqueeze(1)                        # [B, 1, S] 广播到通道维
+        return x_local * gate
+
+
+class FcaGate(nn.Module):
+    """频域通道门控（FcaNet 思路，替换 SECNet gated fusion 的通道门控）。
+
+    原 gated fusion：x_global = avg_pool(x)（= 最低频 DCT 分量，即 DC/均值）
+    -> group_conv -> sigmoid -> 逐通道门控。SECNet 门控本质是 SENet 的 SE 通道
+    注意力，其「全局平均池化」只取了 DCT 的 DC 分量。
+
+    本组件按 FcaNet（Frequency Channel Attention Networks, Qin et al. ICCV 2021）
+    的思想，把「仅 DC 分量」扩展为「前 num_freq 个低频 DCT 分量」：每个通道用
+    多个频率分量压缩成一个 num_freq 维描述子，再经 FC 学出逐通道门控。
+    num_freq=1 时信息上等价于全局平均池化（DC 投影与 mean 成正比），但结构
+    是 Linear-ReLU-Linear 而非原版 group_conv-bn，非严格退化。保留「逐通道
+    门控」语义，不换粒度（与 HyperbolicGate 的逐组门控形成对照）。
+
+    机制：
+        freq_c = DCT-II(x_src[:, c, :])[:num_freq]       # [B, C, num_freq]
+        gate   = sigmoid(FC(freq.reshape(B, C*num_freq))) # [B, C]
+        x      = x_local * gate.unsqueeze(-1)            # 逐通道门控
+
+    预计算 DCT-II 基矩阵（seq_len = group_number[i]，每 stage 不同），基向量
+    L2 归一化使各频率分量尺度一致（否则 DC 分量量级是高频分量的 √S 倍）。
+    bottleneck 降维控制参数量（≈ +12%）。
+    """
+
+    def __init__(self, channels: int, seq_len: int, num_freq: int = 4,
+                 reduction: int = 8):
+        super().__init__()
+        self.channels = channels
+        self.num_freq = num_freq
+        # 预计算 DCT-II 基矩阵 [num_freq, seq_len]，L2 归一化
+        n = torch.arange(seq_len, dtype=torch.float32)
+        i = torch.arange(num_freq, dtype=torch.float32)
+        basis = torch.cos(math.pi * i.unsqueeze(1) * (n.unsqueeze(0) + 0.5) / seq_len)
+        basis = F.normalize(basis, dim=1)                # 每行单位范数
+        self.register_buffer('basis', basis)             # [num_freq, seq_len]
+        hidden = max(channels // reduction, 8)
+        self.fc = nn.Sequential(
+            nn.Linear(channels * num_freq, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels),
+        )
+
+    def forward(self, x_local: torch.Tensor, x_src: torch.Tensor) -> torch.Tensor:
+        """频域通道门控。
+
+        Args:
+            x_local: [B, C, S] local 分支输出（被门控的对象）
+            x_src:   [B, C, S] 门控特征源（傅里叶时间聚合 + gelu 后、conv 前）
+        Returns:
+            [B, C, S] x_local * gate，gate 为 [B, C, 1] 逐通道门控
+        """
+        B, C, S = x_src.shape
+        if S != self.basis.shape[1]:
+            raise ValueError("FcaGate seq_len mismatch: forward S=%d, basis built for %d"
+                             % (S, self.basis.shape[1]))
+        # 每个通道在 S 维上投影到 num_freq 个 DCT 频率分量
+        basis = self.basis.to(x_src.dtype)               # 兼容 AMP（fp16）
+        freq = torch.matmul(x_src, basis.t())            # [B, C, num_freq]
+        freq = freq.reshape(B, C * self.num_freq)        # [B, C*num_freq]
+        gate = torch.sigmoid(self.fc(freq))              # [B, C]
+        return x_local * gate.unsqueeze(-1)              # [B, C, S]
+
+
+class HyperbolicRadialRectify(nn.Module):
+    """曲率感知双曲径向校正（CHR，PointCHR 思路，arXiv 2607.24052，2026-07）。
+
+    PointCHR 核心：点云里高曲率/精细区域（物体边缘、复杂结构）在空间分布
+    长尾稀疏，欧氏多项式体积增长使其被低曲率平滑区域淹没、难以分辨。利用
+    双曲流形边界「指数体积增长」的特性，把复杂度高的点投影到边界（更大
+    有效容量），缓解欧氏表示拥挤（representation crowding）。
+
+    事件点云（t,x,y,p）无几何曲率，用可学习复杂度分数 κ 作代理：κ 大的点
+    （离群/精细）获得更大径向半径（投影到边界），κ 小的点留在中心。与
+    HyperbolicGate（离质心近→门控大）形成相反的设计：本组件「增强」离群点
+    而非抑制。
+
+    机制（Lorentz 流形内径向校正 + 残差；α 用 softplus 避免 abs 零点梯度坑）：
+        κ    = sigmoid(Linear(x))       # [B,N,1] 复杂度分数
+        h_hyp= lorentz_exp_origin(h, c) # 先进 Lorentz [B,N,d_h+1]
+        x0'  = x0 * (1 + α*κ)           # Lorentz 内缩放 x0（κ大→边界），保流形约束
+        out  = out_proj(log(h_hyp')) + x # log 回来 + 残差
+
+    注意：径向校正必须在 Lorentz 内（exp 之后）做，不能先在欧氏调半径再
+    exp/log——否则 exp/log 首尾恒等、双曲失效（实测差值 1e-7）。
+    """
+
+    def __init__(self, channels: int, hidden_dim: int = 64, curvature_init: float = 0.4):
+        super().__init__()
+        self.channels = channels
+        self.hidden_dim = hidden_dim
+        c_init = math.log(math.expm1(curvature_init))
+        self.curvature = nn.Parameter(torch.tensor(c_init))
+        self.in_proj = nn.Linear(channels, hidden_dim)
+        self.complexity = nn.Linear(channels, 1)          # 复杂度分数 κ
+        self.out_proj = nn.Linear(hidden_dim, channels)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        # α 用 softplus 参数化保证恒正（α≈0.1）；径向校正在 Lorentz 流形内
+        # 缩放 x0，无需独立 r0（x0 本身由 h 的范数决定）
+        self.alpha_raw = nn.Parameter(torch.tensor(math.log(math.expm1(0.1))))
+
+    def _curvature(self) -> torch.Tensor:
+        return F.softplus(self.curvature) + 1e-4
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """曲率引导的径向校正。
+
+        Args:
+            x: [B, N, C] 特征（embed 后、stage 前）
+        Returns:
+            [B, N, C] 残差校正后的特征
+        """
+        c = self._curvature()
+        h = self.layer_norm(self.in_proj(x))              # [B, N, d_h]
+        kappa = torch.sigmoid(self.complexity(x))         # [B, N, 1] 复杂度分数
+        alpha = F.softplus(self.alpha_raw)                # 恒正
+        # 进 Lorentz 流形后做径向校正（不能在欧氏调半径再 exp/log，否则 exp/log
+        # 首尾恒等、双曲失效——已验证 h_euc≈v 差值 1e-7）
+        h_hyp = lorentz_exp_origin(h, c)                  # [B, N, d_h+1]
+        x0 = h_hyp[..., 0:1]                              # 时间分量（径向位置）
+        x_rest = h_hyp[..., 1:]
+        x0_new = x0 * (1.0 + alpha * kappa)               # 高复杂度 → x0 大 → 边界
+        # 保持流形约束 x0² - ‖x_rest‖² = 1/c
+        scale = torch.sqrt((x0_new ** 2 - 1.0 / c).clamp_min(1e-6)
+                           / (x0 ** 2 - 1.0 / c).clamp_min(1e-6))
+        h_hyp_rect = torch.cat([x0_new, x_rest * scale], dim=-1)
+        h_euc = lorentz_log_origin(h_hyp_rect, c)         # [B, N, d_h]
+        out = self.out_proj(h_euc)                        # [B, N, C]
+        return x + out                                    # 残差
+
+
+class PolarFeatureLayer(nn.Module):
+    """方向/半径分离特征层（Polar FC 思路，arXiv 2609.32899，欧氏对照版）。
+
+    核心：传统 Linear 输出半径由 ‖Wx+b‖ 决定、不可独立控制，大半径处 Lorentz
+    内积数值不稳（论文 A 节）。本组件把特征分解为方向（单位向量）与半径（标量），
+    分别可学习映射再合回，半径可独立学。
+
+    与 HyperbolicRadialRectify（chr，在双曲流形内做径向校正）形成「欧氏 vs 双曲」
+    对照：两者同挂 embed 后，配对差可回答「双曲流形相对欧氏方向/半径分离的
+    增量」，呼应 Hyper² 对「双曲是否装饰」的审计。
+
+    机制（与 chr 结构镜像，唯一变量=是否进双曲；残差）：
+        h    = LayerNorm(in_proj(x))     # [B,N,d_h]
+        κ    = sigmoid(complexity(x))    # [B,N,1]（同 chr）
+        h'   = h * (1 + α*κ)             # 欧氏径向校正（对应 chr 的 Lorentz x0 缩放）
+        out  = out_proj(h')              # [B,N,C]
+        return x + out                   # 残差
+
+    严格对照 chr：chr = exp → [Lorentz 内缩放 x0 + 流形约束] → log；
+    本组件 = [欧氏缩放范数]。除 exp/log 与 curvature 外结构逐项对齐。
+    """
+
+    def __init__(self, channels: int, hidden_dim: int = 64):
+        super().__init__()
+        self.channels = channels
+        self.hidden_dim = hidden_dim
+        # 与 chr 结构镜像（同 in_proj/complexity/alpha_raw），只是不进双曲
+        self.in_proj = nn.Linear(channels, hidden_dim)
+        self.complexity = nn.Linear(channels, 1)
+        self.out_proj = nn.Linear(hidden_dim, channels)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.alpha_raw = nn.Parameter(torch.tensor(math.log(math.expm1(0.1))))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.layer_norm(self.in_proj(x))              # [B, N, d_h]
+        kappa = torch.sigmoid(self.complexity(x))         # [B, N, 1] 复杂度分数
+        alpha = F.softplus(self.alpha_raw)                # 恒正
+        h_rect = h * (1.0 + alpha * kappa)                # 欧氏径向校正（对应 chr 的 x0 缩放）
+        out = self.out_proj(h_rect)                       # [B, N, C]
+        return x + out                                    # 残差
+
 
 class HyperbolicMLP(nn.Module):
     """双曲 MLP（P0-2 --hyperbolic_mlp）：Möbius 线性 + 偏置 + 双曲激活。
@@ -732,6 +975,10 @@ class FECNet(nn.Module):
                  use_hyperbolic_embedding: bool = False,
                  use_hyperbolic_attention: bool = False,
                  use_hyperbolic_mlp: bool = False,
+                 use_hyperbolic_gate: bool = False,
+                 use_fca_gate: bool = False,
+                 use_hyperbolic_radial: bool = False,
+                 use_polar_feature: bool = False,
                  use_event_mamba_ssm: bool = False,
                  use_spike_time_enc: bool = False,
                  use_scale_norm_fps: bool = False,
@@ -743,6 +990,12 @@ class FECNet(nn.Module):
         # 修复A：两个 selector 同开时下方 if/elif 会静默走 rp1，必须显式报错
         if use_rp1_selector and use_hyperbolic_selector:
             raise ValueError("rp1_selector 与 hyperbolic_selector 互斥，只能选一个")
+        # 两个门控都是替换 gated fusion 的备选（同层互斥，类似 rp1/hsel）：
+        # 同开时 forward 的 if/elif 会静默走 hyperbolic_gate，必须显式报错
+        if use_hyperbolic_gate and use_fca_gate:
+            raise ValueError("hyperbolic_gate 与 fca_gate 互斥（同层门控，只能选一个）")
+        if use_hyperbolic_radial and use_polar_feature:
+            raise ValueError("hyperbolic_radial 与 polar_feature 互斥（同层特征组件，只能选一个）")
         # 2026-10-14 ai2：--hsel_scaled_coords 只对 --hyperbolic_selector 有意义
         # （复现旧版 bug：双曲网格选点用 fps_parameter 缩放后坐标）。
         # 不带 hyperbolic_selector 时按 no-op 并警告，不抛错（推理工具
@@ -766,6 +1019,13 @@ class FECNet(nn.Module):
         if use_hyperbolic_mlp and not use_hyperbolic_attention:
             print('[FECNet] 警告: use_hyperbolic_mlp 需与 use_hyperbolic_attention '
                   '同开才有意义（否则没有双曲注意力输出可变换），当前按 no-op 处理')
+        # 替换式双曲门控（共识③ 融合层 gated→双曲加权）：替换 gated fusion 的
+        # 欧氏通道门控，门控信号改由双曲距离学出。默认关闭；hyper_gates 仅在
+        # 开启时创建，group_conv/bn_global 参数保留但不被调用（state_dict 键稳定）
+        self.use_hyperbolic_gate = use_hyperbolic_gate
+        self.use_fca_gate = use_fca_gate
+        self.use_hyperbolic_radial = use_hyperbolic_radial
+        self.use_polar_feature = use_polar_feature
         self.use_event_mamba_ssm = use_event_mamba_ssm
         self.use_spike_time_enc = use_spike_time_enc
         if use_hyperbolic_fusion:
@@ -870,6 +1130,27 @@ class FECNet(nn.Module):
                     HyperbolicMLP(self.feature_list[i + 1])
                     for i in range(self.stages)
                 ])
+        if self.use_hyperbolic_gate:
+            # 替换式双曲门控：每 stage 一个 HyperbolicGate（双曲距离门控），
+            # 替换 gated fusion 的 global 分支 + sigmoid 通道门控
+            self.hyper_gates = nn.ModuleList([
+                HyperbolicGate(self.feature_list[i + 1])
+                for i in range(self.stages)
+            ])
+        if self.use_fca_gate:
+            # 频域通道门控（FcaNet 思路）：每 stage 一个 FcaGate，用多频率 DCT
+            # 分量（非仅 DC 均值）压缩每个通道，学出逐通道门控
+            self.fca_gates = nn.ModuleList([
+                FcaGate(self.feature_list[i + 1], self.group_number[i])
+                for i in range(self.stages)
+            ])
+        if self.use_hyperbolic_radial:
+            # 曲率感知双曲径向校正（PointCHR 思路）：挂在 embed 后、stage 前，
+            # 单模块（非每 stage），对每个点的特征做径向校正
+            self.hyper_radial = HyperbolicRadialRectify(self.feature_list[0])
+        if self.use_polar_feature:
+            # 方向/半径分离（Polar FC 思路，欧氏对照）：同挂 embed 后，单模块
+            self.polar_feature = PolarFeatureLayer(self.feature_list[0])
 
     def forward(self, x: torch.Tensor):
         xyz = x.permute(0, 2, 1)
@@ -894,6 +1175,12 @@ class FECNet(nn.Module):
             embed_in = torch.cat([xyz[..., 1:4], kda_feat], dim=-1).permute(0, 2, 1)  # [B, 19, N]
         x = self.embed_dim(embed_in)
         x = x.permute(0, 2, 1)
+        if self.use_hyperbolic_radial:
+            # 曲率感知双曲径向校正（PointCHR）：embed 后、stage 前做逐点径向校正
+            x = self.hyper_radial(x)
+        elif self.use_polar_feature:
+            # 方向/半径分离（Polar FC，欧氏对照）：embed 后做方向/半径分离
+            x = self.polar_feature(x)
         for i in range(self.stages):
             xyz, x = self.local_grouper_list[i](xyz, x)
             # 版本5 --hyperbolic_fusion：local 分组特征先送入双曲支路（副本引用，
@@ -926,13 +1213,21 @@ class FECNet(nn.Module):
             # local branch
             x_local = self.conv_list[i](x)
             x_local = self.bn_local_list[i](x_local)
-            # global branch: mean pool -> conv -> expand -> gate
-            x_global = F.adaptive_avg_pool1d(x, 1)
-            x_global = self.group_conv_list[i](x_global)
-            x_global = self.bn_global_list[i](x_global)
-            x_global = x_global.expand(-1, -1, n)
-            # gated fusion
-            x = x_local * torch.sigmoid(x_global)
+            if self.use_hyperbolic_gate:
+                # 替换式双曲门控（共识③ gated→双曲加权）：门控信号由双曲距离
+                # 学出，替换原 global 分支（mean pool -> group_conv -> sigmoid）
+                x = self.hyper_gates[i](x_local, x)
+            elif self.use_fca_gate:
+                # 频域通道门控（FcaNet 思路）：门控信号由多频率 DCT 分量学出
+                x = self.fca_gates[i](x_local, x)
+            else:
+                # global branch: mean pool -> conv -> expand -> gate
+                x_global = F.adaptive_avg_pool1d(x, 1)
+                x_global = self.group_conv_list[i](x_global)
+                x_global = self.bn_global_list[i](x_global)
+                x_global = x_global.expand(-1, -1, n)
+                # gated fusion
+                x = x_local * torch.sigmoid(x_global)
             x = x.permute(0, 2, 1)  # [B, S, C] = F_fourier
             if self.use_event_mamba_ssm and i == self.stages - 1:
                 x_ssm = self.mamba_ssms[0](x)

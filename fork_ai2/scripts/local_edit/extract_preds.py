@@ -59,6 +59,12 @@ FLAG_KEYS = [
     # 选点坐标口径（缩放后 vs 原始），缺失时按 False 重建会得到错误的
     # "双曲+缩放坐标"实验结果。
     "hsel_scaled_coords",
+    # 2026-10-18 ai2：hyperbolic_gate / fca_gate 增删 hyper_gates/fca_gates 模块，
+    # 且替换 gated fusion 的 forward 路径。缺失时按 False 重建会用从未训练的
+    # group_conv/bn_global 推理，结果静默错误（同 scale_norm 那次的 bug 模式）。
+    "hyperbolic_gate", "fca_gate",
+    # 2026-10-18：hyperbolic_radial 增删 hyper_radial 模块 + 改 embed 后 forward 路径
+    "hyperbolic_radial", "polar_feature",
 ]
 
 
@@ -98,7 +104,9 @@ def build_model(saved_args, num_category):
     # 2026-10-14 ai2 补齐：新增 flag 在旧 checkpoint/旧日志里可能不存在
     # （argparse default=False），与 parse_flags_from_log 的兜底策略一致：缺键视为 False。
     defaults = {"hyperbolic_mlp": False, "scale_norm_fps": False,
-                "hsel_scaled_coords": False}
+                "hsel_scaled_coords": False,
+                "hyperbolic_gate": False, "fca_gate": False,
+                "hyperbolic_radial": False, "polar_feature": False}
     for key, val in defaults.items():
         if key not in saved_args:
             saved_args[key] = val
@@ -122,6 +130,10 @@ def build_model(saved_args, num_category):
         use_hyperbolic_mlp=saved_args["hyperbolic_mlp"],
         use_scale_norm_fps=saved_args["scale_norm_fps"],
         use_hsel_scaled_coords=saved_args["hsel_scaled_coords"],
+        use_hyperbolic_gate=saved_args["hyperbolic_gate"],
+        use_fca_gate=saved_args["fca_gate"],
+        use_hyperbolic_radial=saved_args["hyperbolic_radial"],
+        use_polar_feature=saved_args["polar_feature"],
     ), {k: saved_args[k] for k in FLAG_KEYS}
 
 
