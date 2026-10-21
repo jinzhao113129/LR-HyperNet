@@ -377,6 +377,17 @@ def progress_bar(current, total, msg=None):
     if current == 0:
         begin_time = time.time()  # Reset for new bar.
 
+    # 时间戳每步更新，Step/Tot 显示的是真实单步耗时与累计耗时（不因节流漂移）。
+    cur_time = time.time()
+    step_time = cur_time - last_time
+    last_time = cur_time
+
+    # 日志重定向后 \r 不生效，每个 batch 刷一整行 → log 暴涨。只每 50 步 +
+    # 末步打一次，训练信息（loss/acc/step）一行不少，进度条减少约 98%。
+    PROGRESS_THROTTLE = 50
+    if (current + 1) % PROGRESS_THROTTLE != 0 and current < total - 1:
+        return
+
     cur_len = int(TOTAL_BAR_LENGTH*current/total)
     rest_len = int(TOTAL_BAR_LENGTH - cur_len) - 1
 
@@ -388,9 +399,6 @@ def progress_bar(current, total, msg=None):
         sys.stdout.write('.')
     sys.stdout.write(']')
 
-    cur_time = time.time()
-    step_time = cur_time - last_time
-    last_time = cur_time
     tot_time = cur_time - begin_time
 
     L = []
@@ -402,11 +410,7 @@ def progress_bar(current, total, msg=None):
     msg = ''.join(L)
     sys.stdout.write(msg)
     sys.stdout.write(' %d/%d ' % (current+1, total))
-
-    if current < total-1:
-        sys.stdout.write('\r')
-    else:
-        sys.stdout.write('\n')
+    sys.stdout.write('\n')
     sys.stdout.flush()
 
 def format_time(seconds):
