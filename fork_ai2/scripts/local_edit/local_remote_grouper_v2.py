@@ -1069,10 +1069,11 @@ class LocalRemoteGrouper(nn.Module):
         self.remote_kda_enc = KDACausalEncoder(channel) if remote_kda else None
         # Remote 分支：远程邻居选择 + 双曲聚合
         self.remote_selector = RemoteSelector(remote_g=remote_g,
-                                              # 双曲距离矩阵是 [B,S,chunk,C+1] 向量（欧氏是标量 [B,S,chunk]），
-                                              # 显存贵 ~65 倍；chunk=1024 时单块 8.7GB 会 OOM
-                                              # （3090 batch16 实测）。降 128 让矩阵 ~1.1GB。
-                                              chunk=128,
+                                              # 双曲距离矩阵是 [B,S,N,C+1] 向量（欧氏是标量），显存贵 ~65 倍。
+                                              # 分块（chunk）决定两个矩阵：块内 ∝ chunk、候选并集 ∝ N/chunk*G，
+                                              # 平衡点 chunk≈sqrt(N*G)=sqrt(10240*16)≈405，取 512。
+                                              # batch16 下无论 chunk 怎么调都 ~10GB 会 OOM，须配合降 batch（8）。
+                                              chunk=512,
                                               anchor_lambda=anchor_lambda,
                                               use_hyperbolic=use_hyperbolic_selector,
                                               curvature_init=curvature_init,
