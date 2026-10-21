@@ -17,7 +17,7 @@
 # 组装后的布局（HPC 侧 ~/zhaojin/pi2 同构，两边可对照）：
 #   ~/zhaojin/pi2/
 #     ├── tools/train_frequency_ncaltech.py   ← fork_ai2/scripts/local_edit/
-#     ├── models/{FECNet,modules,local_remote_grouper}.py
+#     ├── models/{FECNet,modules,local_remote_grouper,local_remote_grouper_v2}.py
 #     ├── provider_data.py augment_data.py    ← code/
 #     ├── data/{train.h5 test.h5}             ← GitHub Release data-baidu-small
 #     └── log/classification/<name>/          ← 训练产物
@@ -134,8 +134,10 @@ do_setup() {
 
   echo "=== [4/4] 编译 + import + GPU 自检 ==="
   cd "$WORK"
-  "$PY" -m py_compile tools/train_frequency_ncaltech.py models/FECNet.py \
-    models/modules.py models/local_remote_grouper.py provider_data.py augment_data.py \
+  "$PY" -m py_compile tools/train_frequency_ncaltech.py tools/extract_preds.py \
+    tools/test_g16_memory.py models/FECNet.py models/modules.py \
+    models/local_remote_grouper.py models/local_remote_grouper_v2.py \
+    provider_data.py augment_data.py \
     && echo COMPILE_OK
   # 真实 import 冒烟（py_compile 只查语法不查依赖；这里全链 import + CUDA）
   PYTHONPATH="$WORK:$WORK/models" "$PY" -c "
