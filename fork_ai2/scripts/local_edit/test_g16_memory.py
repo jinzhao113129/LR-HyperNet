@@ -13,14 +13,14 @@
 import sys
 import subprocess
 
-B, N, ACCUM = 16, 10240, 2
+B, N, ACCUM = 8, 10240, 2
 TREATMENTS = ['hyp_far', 'rp1_scorer']
 
 CHILD = r'''
 import sys, torch
 sys.path.insert(0, '.')
 from FECNet import FECNet
-B, N, ACCUM = 16, 10240, 2
+B, N, ACCUM = 8, 10240, 2
 treatment = sys.argv[1]
 assert torch.cuda.is_available(), "需要 CUDA"
 print("GPU: %s" % torch.cuda.get_device_name(0))
