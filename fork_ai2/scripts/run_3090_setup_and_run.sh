@@ -47,6 +47,7 @@ chain_flags() {
     chr) echo "--hyperbolic_radial" ;;
     polar) echo "--polar_feature" ;;
     hclf) echo "--hyperbolic_classifier" ;;
+    g16) echo "--remote_g16" ;;
     *) echo "UNKNOWN_CHAIN"; exit 2 ;;
   esac
 }
