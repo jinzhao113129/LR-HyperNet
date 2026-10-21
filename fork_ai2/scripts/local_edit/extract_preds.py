@@ -140,6 +140,7 @@ def build_model(saved_args, num_category):
         use_polar_feature=saved_args["polar_feature"],
         use_remote_g16=saved_args["remote_g16"],
         g16_treatment=saved_args.get("g16_treatment", ""),
+        g16_rng_seed=saved_args.get("g16_rng_seed", saved_args.get("seed", 42)),
     ), {k: saved_args[k] for k in FLAG_KEYS}
 
 
