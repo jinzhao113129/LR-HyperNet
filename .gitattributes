@@ -1,0 +1,6 @@
+# 强制 LF 行尾（3090 Linux 上 bash/python 拒绝 CRLF）
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.tex text eol=lf
+*.sbatch text eol=lf
