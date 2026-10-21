@@ -47,7 +47,6 @@ chain_flags() {
     chr) echo "--hyperbolic_radial" ;;
     polar) echo "--polar_feature" ;;
     hclf) echo "--hyperbolic_classifier" ;;
-    g16) echo "--remote_g16" ;;
     g16_hypfar) echo "--remote_g16 --g16_treatment hyp_far" ;;
     g16_eucfar) echo "--remote_g16 --g16_treatment euc_far" ;;
     g16_eucnear) echo "--remote_g16 --g16_treatment euc_near" ;;
@@ -68,16 +67,27 @@ do_setup() {
   mkdir -p "$WORK/tools" "$WORK/models" "$WORK/code/analysis" "$WORK/data" "$WORK/log"
 
   # 代码：从 clone 的仓库复制（本地复制不违反禁 SCP——不经过本机）
-  for f in train_frequency_ncaltech.py extract_preds.py; do
-    [ -f "$WORK/tools/$f" ] || cp "$REPO/fork_ai2/scripts/local_edit/$f" "$WORK/tools/"
+  # md5 比较覆盖（Codex P0-2 修复）：旧文件存在但内容不同时更新；
+  # 原 [ -f ] || cp 会跳过旧文件、新代码永远进不了运行目录
+  copy_if_diff() {
+    local src="$1" dst="$2"
+    if [ ! -f "$dst" ]; then
+      cp "$src" "$dst"
+    elif [ "$(md5sum < "$src" | cut -d' ' -f1)" != "$(md5sum < "$dst" | cut -d' ' -f1)" ]; then
+      cp "$src" "$dst"
+      echo "  更新: $(basename "$dst")"
+    fi
+  }
+  for f in train_frequency_ncaltech.py extract_preds.py test_g16_memory.py; do
+    copy_if_diff "$REPO/fork_ai2/scripts/local_edit/$f" "$WORK/tools/$f"
   done
-  for f in FECNet.py modules.py local_remote_grouper.py; do
-    [ -f "$WORK/models/$f" ] || cp "$REPO/fork_ai2/scripts/local_edit/$f" "$WORK/models/"
+  for f in FECNet.py modules.py local_remote_grouper.py local_remote_grouper_v2.py; do
+    copy_if_diff "$REPO/fork_ai2/scripts/local_edit/$f" "$WORK/models/$f"
   done
   for f in provider_data.py augment_data.py; do
-    [ -f "$WORK/$f" ] || cp "$REPO/code/$f" "$WORK/"
+    copy_if_diff "$REPO/code/$f" "$WORK/$f"
   done
-  [ -f "$WORK/code/analysis/mcnemar_test.py" ] || cp "$REPO/code/analysis/mcnemar_test.py" "$WORK/code/analysis/"
+  copy_if_diff "$REPO/code/analysis/mcnemar_test.py" "$WORK/code/analysis/mcnemar_test.py"
 
   echo "=== [2/4] 数据下载（GitHub Release，release 通道 = 学长认可） ==="
   if [ -f "$WORK/data/train.h5" ] && [ -f "$WORK/data/test.h5" ]; then

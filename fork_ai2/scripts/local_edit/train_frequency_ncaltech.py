@@ -593,6 +593,7 @@ def main(args):
                         use_kda=args.kda,
                         use_remote_g16=args.remote_g16,
                         g16_treatment=args.g16_treatment,
+                        g16_rng_seed=args.seed,
                         use_rp1_selector=args.rp1_selector,
                         use_hyperbolic_selector=args.hyperbolic_selector,
                         use_spike_time_enc=args.spike_time_enc,

@@ -973,6 +973,7 @@ class FECNet(nn.Module):
                  use_kda: bool = False,
                  use_remote_g16: bool = False,
                  g16_treatment: str = "",
+                 g16_rng_seed: int = 42,
                  use_rp1_selector: bool = False,
                  use_hyperbolic_selector: bool = False,
                  use_hyperbolic_classifier: bool = False,
@@ -1074,6 +1075,7 @@ class FECNet(nn.Module):
                                                      kneighbors=24, remote_g=16,
                                                      use_xyz=True, normalize="center",
                                                      g16_treatment=g16_treatment,
+                                                     g16_rng_seed=g16_rng_seed,
                                                      stage_idx=i)
             elif use_rp1_selector:
                 local_grouper = RP1SpatialUniformGrouper(self.feature_list[i], self.group_number[i], 24, True, "center", use_scale_norm_fps=use_scale_norm_fps)

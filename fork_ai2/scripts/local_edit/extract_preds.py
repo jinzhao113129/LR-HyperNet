@@ -192,6 +192,13 @@ def extract_one(log_dir, which, data_path, device, num_point, num_category,
         if saved_args is None:
             print("[SKIP] %s: no args in checkpoint and no Namespace line in log" % log_dir)
             return None
+        # Codex P1-3：日志 fallback 只解析 bool flag，g16_treatment 是 str 无法
+        # 恢复，静默回退成空串（euc_far）会推理错实现。remote_g16 的旧日志
+        # 直接报错，要求改用带 args 的 checkpoint（G16 训练均保存 args）。
+        if saved_args.get("remote_g16"):
+            raise ValueError(
+                "%s: remote_g16 依赖 g16_treatment（str），日志无法可靠恢复；"
+                "请使用带 args 的 checkpoint 推理" % log_dir)
 
     # Cross-check the reshape/loader settings against what the run actually used.
     if meta:
