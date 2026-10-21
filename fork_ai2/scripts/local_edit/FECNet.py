@@ -10,10 +10,12 @@ import numpy as np
 
 try:  # 兼容两种导入上下文：从项目根目录包导入 / models 目录在 sys.path 中
     from local_remote_grouper import (KDACausalEncoder, HyperbolicPrototypeClassifier,
+                                      LocalRemoteGrouper,
                                       lorentz_exp_origin, lorentz_log_origin, lorentz_distance,
                                       poincare_exp_origin, poincare_log_origin, clip_to_disk)
 except ImportError:  # pragma: no cover
     from models.local_remote_grouper import (KDACausalEncoder, HyperbolicPrototypeClassifier,
+                                             LocalRemoteGrouper,
                                              lorentz_exp_origin, lorentz_log_origin,
                                              lorentz_distance,
                                              poincare_exp_origin, poincare_log_origin,
@@ -968,6 +970,7 @@ class FECNet(nn.Module):
                  use_group_norm: bool = False,
                  use_time_enc: bool = False,
                  use_kda: bool = False,
+                 use_remote_g16: bool = False,
                  use_rp1_selector: bool = False,
                  use_hyperbolic_selector: bool = False,
                  use_hyperbolic_classifier: bool = False,
@@ -990,6 +993,8 @@ class FECNet(nn.Module):
         # 修复A：两个 selector 同开时下方 if/elif 会静默走 rp1，必须显式报错
         if use_rp1_selector and use_hyperbolic_selector:
             raise ValueError("rp1_selector 与 hyperbolic_selector 互斥，只能选一个")
+        if use_remote_g16 and (use_rp1_selector or use_hyperbolic_selector):
+            raise ValueError("remote_g16 与 rp1_selector/hyperbolic_selector 互斥（同层采样，只能选一个）")
         # 两个门控都是替换 gated fusion 的备选（同层互斥，类似 rp1/hsel）：
         # 同开时 forward 的 if/elif 会静默走 hyperbolic_gate，必须显式报错
         if use_hyperbolic_gate and use_fca_gate:
@@ -1059,7 +1064,16 @@ class FECNet(nn.Module):
         self.bn_global_list = nn.ModuleList()
         self.attention = Attention(self.feature_list[-1])
         for i in range(self.stages):
-            if use_rp1_selector:
+            if use_remote_g16:
+                # 16 点远程选择（论文灵魂）：替换 LocalGrouper 的中心点特征拼接为
+                # 远程双曲聚合特征，remote_g=16、双曲距离选点（lorentz）
+                local_grouper = LocalRemoteGrouper(self.feature_list[i], self.group_number[i],
+                                                   kneighbors=24, remote_g=16,
+                                                   use_xyz=True, normalize="center",
+                                                   use_hyperbolic_selector=True,
+                                                   hyperbolic_type="lorentz",
+                                                   selector_mode="topk")
+            elif use_rp1_selector:
                 local_grouper = RP1SpatialUniformGrouper(self.feature_list[i], self.group_number[i], 24, True, "center", use_scale_norm_fps=use_scale_norm_fps)
             elif use_hyperbolic_selector:
                 local_grouper = HyperbolicUniformGrouper(self.feature_list[i], self.group_number[i], 24, True, "center", use_scale_norm_fps=use_scale_norm_fps, use_scaled_coords=use_hsel_scaled_coords)
