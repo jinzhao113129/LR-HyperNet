@@ -81,8 +81,14 @@ def parse_args():
                              ' 同开；单独开按 no-op 警告处理')
     parser.add_argument('--remote_g16', action='store_true', default=False,
                         help='16 点远程选择（论文灵魂）：采样层用 LocalRemoteGrouper 替换'
-                             'LocalGrouper，remote_g=16、双曲距离选点（lorentz）。'
-                             '与 --rp1_selector / --hyperbolic_selector 互斥')
+                             'LocalGrouper，remote_g=16。与 --rp1_selector / '
+                             '--hyperbolic_selector 互斥。需配合 --g16_treatment 选准则')
+    parser.add_argument('--g16_treatment', type=str, default='',
+                        choices=['', 'random', 'spatial_fixed', 'euc_far', 'euc_near',
+                                 'hyp_far', 'rp1_scorer'],
+                        help='G16 六处理选点准则（需与 --remote_g16 同开）：空串=原 topk'
+                             '双曲行为；random/spatial_fixed/euc_far/euc_near/hyp_far/'
+                             'rp1_scorer（hyp_far=双曲距离选点，学长核心想法）')
     parser.add_argument('--rp1_selector', action='store_true', default=False,
                         help='RP1 spatial-uniform 选点：group center 由 FPS 改为 x,y 空间'
                              '均匀网格采样（只改选点，不动傅里叶聚合）')
@@ -586,6 +592,7 @@ def main(args):
                         use_time_enc=args.time_enc,
                         use_kda=args.kda,
                         use_remote_g16=args.remote_g16,
+                        g16_treatment=args.g16_treatment,
                         use_rp1_selector=args.rp1_selector,
                         use_hyperbolic_selector=args.hyperbolic_selector,
                         use_spike_time_enc=args.spike_time_enc,
@@ -709,7 +716,7 @@ def main(args):
             mismatch_keys = []
             for k in ['data_path','num_point','batch_size','epoch','learning_rate',
                       'optimizer','decay_rate','num_category','grad_accum','seed',
-                      'time_enc','kda','spike_time_enc','remote_g16','rp1_selector','hyperbolic_selector',
+                      'time_enc','kda','spike_time_enc','remote_g16','g16_treatment','rp1_selector','hyperbolic_selector',
                       'hyperbolic_classifier','hyperbolic_fusion','hyperbolic_embedding',
                       'hyperbolic_attention','event_mamba_ssm','group_norm',
                       # 2026-10-14 ai2 补：推理工具 FLAG_KEYS 已含此二键，

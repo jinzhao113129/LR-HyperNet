@@ -65,6 +65,8 @@ FLAG_KEYS = [
     "hyperbolic_gate", "fca_gate",
     # 2026-10-18：hyperbolic_radial 增删 hyper_radial 模块 + 改 embed 后 forward 路径
     "hyperbolic_radial", "polar_feature",
+    # 2026-10-21：remote_g16 增删 remote_selector/hyper_agg 模块 + 采样层换 LocalRemoteGrouper
+    "remote_g16",
 ]
 
 
@@ -106,7 +108,9 @@ def build_model(saved_args, num_category):
     defaults = {"hyperbolic_mlp": False, "scale_norm_fps": False,
                 "hsel_scaled_coords": False,
                 "hyperbolic_gate": False, "fca_gate": False,
-                "hyperbolic_radial": False, "polar_feature": False}
+                "hyperbolic_radial": False, "polar_feature": False,
+                "remote_g16": False,
+                "g16_treatment": ""}
     for key, val in defaults.items():
         if key not in saved_args:
             saved_args[key] = val
@@ -134,6 +138,8 @@ def build_model(saved_args, num_category):
         use_fca_gate=saved_args["fca_gate"],
         use_hyperbolic_radial=saved_args["hyperbolic_radial"],
         use_polar_feature=saved_args["polar_feature"],
+        use_remote_g16=saved_args["remote_g16"],
+        g16_treatment=saved_args.get("g16_treatment", ""),
     ), {k: saved_args[k] for k in FLAG_KEYS}
 
 

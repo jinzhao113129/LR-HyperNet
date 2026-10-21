@@ -48,6 +48,12 @@ chain_flags() {
     polar) echo "--polar_feature" ;;
     hclf) echo "--hyperbolic_classifier" ;;
     g16) echo "--remote_g16" ;;
+    g16_hypfar) echo "--remote_g16 --g16_treatment hyp_far" ;;
+    g16_eucfar) echo "--remote_g16 --g16_treatment euc_far" ;;
+    g16_eucnear) echo "--remote_g16 --g16_treatment euc_near" ;;
+    g16_random) echo "--remote_g16 --g16_treatment random" ;;
+    g16_spatial) echo "--remote_g16 --g16_treatment spatial_fixed" ;;
+    g16_rp1) echo "--remote_g16 --g16_treatment rp1_scorer" ;;
     *) echo "UNKNOWN_CHAIN"; exit 2 ;;
   esac
 }

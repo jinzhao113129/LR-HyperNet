@@ -10,16 +10,17 @@ import numpy as np
 
 try:  # 兼容两种导入上下文：从项目根目录包导入 / models 目录在 sys.path 中
     from local_remote_grouper import (KDACausalEncoder, HyperbolicPrototypeClassifier,
-                                      LocalRemoteGrouper,
                                       lorentz_exp_origin, lorentz_log_origin, lorentz_distance,
                                       poincare_exp_origin, poincare_log_origin, clip_to_disk)
+    # G16 六处理用 v2（带 g16_treatment 分派 + P0-1 修复），旧版无六处理
+    from local_remote_grouper_v2 import LocalRemoteGrouper as LocalRemoteGrouperV2
 except ImportError:  # pragma: no cover
     from models.local_remote_grouper import (KDACausalEncoder, HyperbolicPrototypeClassifier,
-                                             LocalRemoteGrouper,
                                              lorentz_exp_origin, lorentz_log_origin,
                                              lorentz_distance,
                                              poincare_exp_origin, poincare_log_origin,
                                              clip_to_disk)
+    from models.local_remote_grouper_v2 import LocalRemoteGrouper as LocalRemoteGrouperV2
 
 
 def _largest_group_count(channels: int, max_groups: int = 32) -> int:
@@ -971,6 +972,7 @@ class FECNet(nn.Module):
                  use_time_enc: bool = False,
                  use_kda: bool = False,
                  use_remote_g16: bool = False,
+                 g16_treatment: str = "",
                  use_rp1_selector: bool = False,
                  use_hyperbolic_selector: bool = False,
                  use_hyperbolic_classifier: bool = False,
@@ -1065,14 +1067,14 @@ class FECNet(nn.Module):
         self.attention = Attention(self.feature_list[-1])
         for i in range(self.stages):
             if use_remote_g16:
-                # 16 点远程选择（论文灵魂）：替换 LocalGrouper 的中心点特征拼接为
-                # 远程双曲聚合特征，remote_g=16、双曲距离选点（lorentz）
-                local_grouper = LocalRemoteGrouper(self.feature_list[i], self.group_number[i],
-                                                   kneighbors=24, remote_g=16,
-                                                   use_xyz=True, normalize="center",
-                                                   use_hyperbolic_selector=True,
-                                                   hyperbolic_type="lorentz",
-                                                   selector_mode="topk")
+                # 16 点远程选择（论文灵魂）：v2 的 LocalRemoteGrouper（含六处理分派），
+                # g16_treatment 选六种选点准则之一（random/spatial_fixed/euc_far/
+                # euc_near/hyp_far/rp1_scorer，空串=原 topk 双曲行为）
+                local_grouper = LocalRemoteGrouperV2(self.feature_list[i], self.group_number[i],
+                                                     kneighbors=24, remote_g=16,
+                                                     use_xyz=True, normalize="center",
+                                                     g16_treatment=g16_treatment,
+                                                     stage_idx=i)
             elif use_rp1_selector:
                 local_grouper = RP1SpatialUniformGrouper(self.feature_list[i], self.group_number[i], 24, True, "center", use_scale_norm_fps=use_scale_norm_fps)
             elif use_hyperbolic_selector:
