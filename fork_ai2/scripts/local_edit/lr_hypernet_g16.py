@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(BASE_DIR, "models"))
 
 from models.FECNet import (FECNet, Linear1Layer, Linear2Layer, fftlayer,
                            Attention, make_norm1d)
-from models.local_remote_grouper import LocalRemoteGrouper, HyperbolicPrototypeClassifier
+from models.local_remote_grouper_v2 import LocalRemoteGrouper, HyperbolicPrototypeClassifier
 
 
 class LRHyperNet(nn.Module):
@@ -37,7 +37,7 @@ class LRHyperNet(nn.Module):
                  time_enc: bool = False, use_global_anchor: bool = False,
                  anchor_lambda: float = 0.5, kda: bool = False,
                  kda_bidirectional: bool = False,
-                 hyperbolic_type: str = "poincare",
+                 hyperbolic_type: str = "lorentz",
                  use_group_norm: bool = False,
                  hyperbolic_classifier: bool = False,
                  use_hyperbolic_selector: bool = False,
