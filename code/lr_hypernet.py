@@ -1,4 +1,4 @@
-﻿"""
+"""
 LR-HyperNet: Local+Remote 邻域 + 远程邻域双曲聚合的事件分类网络
 
 基于 SECNet/FECNet backbone，仅将每个 stage 的 LocalGrouper 替换为
@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(BASE_DIR, "models"))
 
 from models.FECNet import (FECNet, Linear1Layer, Linear2Layer, fftlayer,
                            Attention, make_norm1d)
-from models.local_remote_grouper import LocalRemoteGrouper, HyperbolicPrototypeClassifier
+from models.local_remote_grouper_v2 import LocalRemoteGrouper, HyperbolicPrototypeClassifier
 
 
 class LRHyperNet(nn.Module):
@@ -37,7 +37,7 @@ class LRHyperNet(nn.Module):
                  time_enc: bool = False, use_global_anchor: bool = False,
                  anchor_lambda: float = 0.5, kda: bool = False,
                  kda_bidirectional: bool = False,
-                 hyperbolic_type: str = "poincare",
+                 hyperbolic_type: str = "lorentz",
                  use_group_norm: bool = False,
                  hyperbolic_classifier: bool = False,
                  use_hyperbolic_selector: bool = False,
@@ -49,7 +49,9 @@ class LRHyperNet(nn.Module):
                  remote_gate: bool = False,
                  remote_kda: bool = False,
                  density_channel: bool = False,
-                 density_bins: int = 32):
+                 density_bins: int = 32,
+                 g16_treatment: str = "",
+                 g16_rng_seed: int = 42):
         """
         Args:
             num_classes: 分类数（N-Caltech101 为 101）
@@ -151,7 +153,10 @@ class LRHyperNet(nn.Module):
                 selector_mode=selector_mode,
                 div_lambda=div_lambda,
                 remote_gate=remote_gate,
-                remote_kda=remote_kda)
+                remote_kda=remote_kda,
+                g16_treatment=g16_treatment,
+                g16_rng_seed=g16_rng_seed,
+                stage_idx=i)
             self.local_grouper_list.append(local_grouper)
             aggregation = Attention(self.feature_list[i + 1])
             self.aggregation_list.append(aggregation)
@@ -236,8 +241,21 @@ class LRHyperNet(nn.Module):
             embed_in = torch.cat([x, density.unsqueeze(1)], dim=1)  # [B, 5, N]
         x = self.embed_dim(embed_in)
         x = x.permute(0, 2, 1)
+        # G16 sink 汇聚（Codex 第三轮 P0-1 修复：独立本地 sink + stage 后汇聚）
+        # 注意：不再把 grouper 的 _g16_stage_sink 直接指向 net._g16_stage_selections
+        # （那会让 grouper forward 末尾的本地 clear() 清掉共享列表——
+        # stage 0 刚写入的记录被立即清空，profiling 永远产出空文件）。
+        # 正确数据流：grouper 写独立本地 sink → 每个 stage 返回后这里
+        # extend 到全局列表并清空本地——profiling 关闭时本地 sink 由
+        # grouper 自己清（_g16_stage_sink=None 时不进入本分支）。
+        _net_sink = getattr(self, '_g16_stage_selections', None)
         for i in range(self.stages):
             xyz, x = self.local_grouper_list[i](xyz, x)
+            # stage 后汇聚：本地 sink 内容搬进全局列表，本地清空（防泄漏）
+            _local_sink = getattr(self.local_grouper_list[i], '_g16_stage_sink', None)
+            if _net_sink is not None and _local_sink is not None:
+                _net_sink.extend(_local_sink)
+                _local_sink.clear()
             x = x.permute(0, 1, 3, 2)
             b, n, d, s = x.size()
             x = x.reshape(-1, d, s)
