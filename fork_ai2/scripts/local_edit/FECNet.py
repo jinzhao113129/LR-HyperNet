@@ -1074,6 +1074,7 @@ class FECNet(nn.Module):
                 local_grouper = LocalRemoteGrouperV2(self.feature_list[i], self.group_number[i],
                                                      kneighbors=24, remote_g=16,
                                                      use_xyz=True, normalize="center",
+                                                     hyperbolic_type="lorentz",  # 聚合器走 lorentz（数值稳定）；poincare 边界 atanh 有梯度尖峰风险
                                                      g16_treatment=g16_treatment,
                                                      g16_rng_seed=g16_rng_seed,
                                                      stage_idx=i)
