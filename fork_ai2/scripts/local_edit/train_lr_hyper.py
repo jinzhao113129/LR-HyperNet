@@ -55,10 +55,10 @@ def parse_args():
                         help='global anchor mixing weight in remote distance')
     parser.add_argument('--hyperbolic_classifier', action='store_true',
                         help='路线A：双曲原型分类头（欧氏backbone+双曲分类层）')
-    parser.add_argument('--hyperbolic_type', type=str, default='poincare',
+    parser.add_argument('--hyperbolic_type', type=str, default='lorentz',
                         choices=['poincare', 'lorentz', 'euclidean'],
-                        help='hyperbolic space type: poincare (default), lorentz (v3.1, no boundary '
-                             'gradient spike), or euclidean (ablation control, same backbone/params)')
+                        help='hyperbolic space type: lorentz (default, v3.1 数值稳定，无边界梯度尖峰), '
+                             'poincare (旧版，有边界 atanh 尖峰风险), or euclidean (消融对照, same backbone/params)')
     parser.add_argument('--remote_dropout', type=float, default=0.0,
                         help='dropout on remote aggregator output (anti-overfit)')
     parser.add_argument('--use_hyperbolic_selector', action='store_true', default=False,
