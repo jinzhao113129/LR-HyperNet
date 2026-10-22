@@ -1490,3 +1490,52 @@ bash fork_ai2/scripts/run_3090_setup_and_run.sh chain   # 6 链串行
 - 背景：用户连环追问（"为何还跑基线""配方是什么""官方有没有配方"
   "60.6 不就是小批量数字吗""全量就是比 82.4 吧"）——口径在问答中
   收敛定稿，此文档即固化版。已推 GitHub main @ 0fe4a5b。
+
+---
+
+## 41. G16 排查双 bug + 全组件双曲体检 + 飞书更新（2026-10-22）
+
+### 背景
+
+首条 G16 链（欧氏最远选点 euc_far）全程 best 44.2%，明显塌（EMA 链 58.6%）。
+排查定位到两个叠加 bug，均已修复并 commit push。
+
+### Bug 1（回归，已修）：聚合器 Lorentz 回落 Poincaré
+
+- 六处理改造时 FECNet 调用 `LocalRemoteGrouperV2` 漏传 `hyperbolic_type`，
+  `hyper_agg` 从审查版设计的 lorentz（数值稳定）回落默认 poincare（边界
+  atanh 梯度尖峰风险）。
+- G16 是"替换"接法（远程双曲聚合完全替换中心点特征），poincare 一坏第二个
+  C 维废掉 → 六 treatment 全塌。
+- 修法：FECNet.py 显式传 `hyperbolic_type="lorentz"`（commit e019032）。
+- 附体检：notes/component_hyperbolic_model_audit_20261022.md——全组件
+  双曲模型体检，区分"替换 vs 残差"接法（替换接法必须 lorentz，残差接法
+  poincare 有兜底不致命）。遗留 P2：HyperbolicEmbedding / HyperbolicMLP
+  仍硬编码 poincare 但带残差保护，暂不动。
+
+### Bug 2（方向反了，已切）：euc_far 选最远，原文有效的是最近
+
+- euc_far 用 `topk(largest=True)` 选特征最远 16 点（假设：最大对比）；
+- RP1 原文 Global Feature-KNN 选的是特征最近（语义远程同源）——方向相反；
+- 已切 euc_near（欧氏最近）重跑。
+
+### euc_near 首段（跑中，斜率健康）
+
+| epoch | euc_far（旧塌） | euc_near（修复后） |
+|---|---:|---:|
+| 1 | 23.2% | 27.5% |
+| 5 | 28.5% | 38.3% |
+
+第 5 轮 euc_near 已超 euc_far 同期近 10pp，无塌迹象，等跑完看收敛。
+
+### 本轮新增笔记（本次 git 一并提交）
+
+- notes/codex_review_g16_20261021.md + codex_task_g16_20261021.md（接线审查）
+- notes/component_hyperbolic_model_audit_20261022.md（全组件双曲体检）
+- notes/scicore_review_prompt_20261022.md（投稿前两阶段审稿 prompt，接论文检查纪律）
+- feishu_update_20261022.md（飞书更新：快测补全 hgate 最强 + G16 排查）
+
+### 状态
+
+- G16 修复 + 节流已 push（e019032 / b8daf9a），euc_near 在 gpu-server-3 跑中；
+- 待 euc_near 收敛判定 G16 是否修复，其余 treatment 与未测组件续跑。
