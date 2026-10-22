@@ -21,9 +21,10 @@
 #   - batch 32 + grad_accum 2（等效 batch 64，与主线 FECNet 全量链同口径）
 #   - remote_g=16（G16 核心，LRHyperNet 默认），curvature_init=0.4（默认）
 #   - 六处理唯一差异 = --g16_treatment；hyp_far 内部把 selector 切到
-#     lorentz 双曲距离选点（local_remote_grouper_v2 的 treatment 映射），
-#     命令行不传 --hyperbolic_type（两条链该 flag 均保持默认 poincare，
-#     hyper_agg 聚合流形两条相同——只有 selector 选点准则不同）。
+#     lorentz 双曲距离选点（local_remote_grouper_v2 的 treatment 映射）。
+#     命令行不传 --hyperbolic_type：该 flag 默认已改为 lorentz（2026-10-22
+#     修 P0-1，train_lr_hyper.py 默认 poincare→lorentz），聚合器不再回落
+#     poincare，selector 与 aggregator 均走 lorentz。
 #   - --g16_profile --g16_profile_p 0.01：训练时 Bernoulli 采样落选择分布
 #     诊断（log/lr_hypernet/<log_dir>/g16_profile.h5），seed 42 固定。
 #   - --augment 2（2026-10-17 加，用户决策"以后跑的所有都做数据增强"）：
