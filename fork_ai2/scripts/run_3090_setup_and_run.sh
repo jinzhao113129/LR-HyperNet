@@ -57,6 +57,15 @@ chain_flags() {
   esac
 }
 # hgate/fca 已在 chain_flags 定义（融合层③候选），但暂不排入快测 6 链（等 Codex 放行）
+# 显存敏感链（Codex P0-2）：hyp_far 双曲距离矩阵 [B,S,N,C+1] 向量贵 ~65 倍、
+# rp1_scorer 打分选点，batch16 会 OOM，须 batch8 + accum4（名义 batch32 对齐）。
+# 其余链 batch16 + accum2。返回 "<batch_size> <grad_accum>"。
+batch_for() {
+  case "$1" in
+    g16_hypfar|g16_rp1) echo "8 4" ;;
+    *) echo "16 2" ;;
+  esac
+}
 CHAIN_ORDER="base ha hsel spike rp1 hmlp"
 
 # ============================================================================
@@ -174,14 +183,15 @@ do_chain() {
       echo "--- [$name] 已完成（$(cat $MARK)），跳过 ---"
       continue
     fi
-    echo "=== [$(date '+%m-%d %H:%M')] 链 $name 开始：$(chain_flags $name) ==="
+    read BS GA <<< "$(batch_for $name)"
+    echo "=== [$(date '+%m-%d %H:%M')] 链 $name 开始（batch=$BS accum=$GA）：$(chain_flags $name) ==="
     # nohup 不用：code-server 终端断开也不杀（code-server 的 shell 是
     # persistent 的），但保险起见用 setsid 脱离会话
     setsid "$PY" tools/train_frequency_ncaltech.py \
       --data_path ./data/ \
       --num_point 10240 \
-      --batch_size 16 \
-      --grad_accum 2 \
+      --batch_size $BS \
+      --grad_accum $GA \
       --epoch 300 \
       --patience 20 \
       --early_stop_metric acc \
