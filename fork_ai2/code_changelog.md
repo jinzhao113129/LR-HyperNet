@@ -1539,3 +1539,35 @@ bash fork_ai2/scripts/run_3090_setup_and_run.sh chain   # 6 链串行
 
 - G16 修复 + 节流已 push（e019032 / b8daf9a），euc_near 在 gpu-server-3 跑中；
 - 待 euc_near 收敛判定 G16 是否修复，其余 treatment 与未测组件续跑。
+
+## 42. G16 hyp_far 复审三 P0 全闭合 + Codex 放行（2026-10-22）
+
+Codex 第二轮复审（接第一轮"暂不可放行 hyp_far"）逐条核验，代码层无残留 P0，放行。
+运行阶段保留两个硬前提（须现场执行）：(a) 3090 实跑 test_g16_memory.py 显存 PASS；
+(b) HPC 运行前打印 lr_hypernet.__file__ + hash + 三 stage lorentz 断言。
+
+### P0-1（LR 路径 lorentz）：闭合
+- lr_hypernet_g16.py 导入旧 grouper → v2；默认 poincare → lorentz；
+- train_lr_hyper.py argparse 默认 poincare → lorentz；
+- local_remote_grouper_v2.py 加逐 stage 断言（hyp_far 时 selector/aggregator 双端 lorentz）。
+
+### P0-2（显存门禁）：闭合
+- test_g16_memory.py 重写（B8/accum4/3 窗口/内联 EMA/external0 判定/exit 1）；
+- run_3090_setup_and_run.sh 加 batch_for()（hyp_far/rp1_scorer → 8/4）。
+
+### P0-3（lr_hypernet 模块路径）：闭合（本轮核心）
+- lr_hypernet_g16.py 内容同步为正式 fork_ai2/scripts/local_edit/lr_hypernet.py；
+- code/lr_hypernet.py 覆盖为修复版（三份 md5 一致）；
+- 补 code/models/local_remote_grouper_v2.py（自包含，不会 ImportError）；
+- code/train_lr_hyper.py 同步（:58 lorentz / :107 --g16_treatment / :112 --ema）；
+- batch_for() 收口 g16_eucnear → 8/4（三 treatment 严格配对）。
+
+### Codex 非阻断提醒（记录备查）
+- verify_hyperbolic_selector.py 测的是旧 RemoteSelector，不能用于验证 G16 hyp_far 选点；
+- local_edit/ 平铺布局无 models/，lr_hypernet.py 的 from models.* 本地不能直接 import
+  （py_compile 只查语法不查 import，属既有部署约定）；
+- CHAIN_ORDER 未排 g16 链，3090 是否跑 g16 属后续调度。
+
+### 状态
+- 代码层全绿，等 euc_near 跑完 → 3090 实跑 test_g16_memory.py（显存 PASS）→ 切 hyp_far；
+- HPC LR 全量路径代码已就绪，恢复时再做 __file__/hash/lorentz 断言现场核验。
