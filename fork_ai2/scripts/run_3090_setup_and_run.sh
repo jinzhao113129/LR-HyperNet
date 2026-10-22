@@ -59,10 +59,12 @@ chain_flags() {
 # hgate/fca 已在 chain_flags 定义（融合层③候选），但暂不排入快测 6 链（等 Codex 放行）
 # 显存敏感链（Codex P0-2）：hyp_far 双曲距离矩阵 [B,S,N,C+1] 向量贵 ~65 倍、
 # rp1_scorer 打分选点，batch16 会 OOM，须 batch8 + accum4（名义 batch32 对齐）。
+# g16_eucnear 本非显存敏感，但为与 hyp_far/rp1_scorer 严格配对（唯一变量=
+# treatment，消除 BN 批统计差异），同样用 batch8 + accum4（2026-10-22 实测同口径）。
 # 其余链 batch16 + accum2。返回 "<batch_size> <grad_accum>"。
 batch_for() {
   case "$1" in
-    g16_hypfar|g16_rp1) echo "8 4" ;;
+    g16_hypfar|g16_rp1|g16_eucnear) echo "8 4" ;;
     *) echo "16 2" ;;
   esac
 }
