@@ -1091,6 +1091,16 @@ class LocalRemoteGrouper(nn.Module):
         else:
             self.hyper_agg = HyperbolicRemoteAggregator(channel, curvature_init=curvature_init,
                                                          hyperbolic_type=hyperbolic_type)
+        # ==== 逐 stage 集成断言（Codex G16 hyp_far 复审 P0-1）====
+        # 防止"selector 走 lorentz 但 aggregator 回落 poincare"的分裂态。
+        # 仅 hyp_far 强校验（六处理中唯一走双曲距离选点的链）；空串=历史 topk 行为不拦。
+        if g16_treatment == 'hyp_far':
+            assert self.remote_selector.use_hyperbolic, \
+                f"[stage {stage_idx}] hyp_far 但 selector.use_hyperbolic=False"
+            assert self.remote_selector.hyperbolic_type == 'lorentz', \
+                f"[stage {stage_idx}] hyp_far 但 selector.hyperbolic_type={self.remote_selector.hyperbolic_type}"
+            assert getattr(self.hyper_agg, 'hyperbolic_type', None) == 'lorentz', \
+                f"[stage {stage_idx}] hyp_far 但 aggregator.hyperbolic_type={getattr(self.hyper_agg, 'hyperbolic_type', None)}"
         # ==== P0-3 修复（Codex）: sink 链路接通 ====
         # g16_treatment 非空时，本 grouper 持有一个 sink 容器并挂到
         # remote_selector。LRHyperNet 的 stage loop 会把所有 grouper 的
