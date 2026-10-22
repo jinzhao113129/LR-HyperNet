@@ -41,4 +41,5 @@ export LD_LIBRARY_PATH=/home/jnguan/JiangYouxin/ZhaoJin/ai2_g16/cudnn8_lib:$LD_L
     --g16_profile_p 0.01 \
     --g16_treatment euc_near \
     --augment 2 \
+    --ema 0.999 \
     --seed 42
