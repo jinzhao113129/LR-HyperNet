@@ -85,10 +85,10 @@ def parse_args():
                              '--hyperbolic_selector 互斥。需配合 --g16_treatment 选准则')
     parser.add_argument('--g16_treatment', type=str, default='',
                         choices=['', 'random', 'spatial_fixed', 'euc_far', 'euc_near',
-                                 'hyp_far', 'rp1_scorer'],
-                        help='G16 六处理选点准则（需与 --remote_g16 同开）：空串=原 topk'
+                                 'hyp_far', 'hyp_near', 'rp1_scorer'],
+                        help='G16 选点准则（需与 --remote_g16 同开）：空串=原 topk'
                              '双曲行为；random/spatial_fixed/euc_far/euc_near/hyp_far/'
-                             'rp1_scorer（hyp_far=双曲距离选点，学长核心想法）')
+                             'hyp_near/rp1_scorer（hyp_far=双曲最远，hyp_near=双曲最近）')
     parser.add_argument('--rp1_selector', action='store_true', default=False,
                         help='RP1 spatial-uniform 选点：group center 由 FPS 改为 x,y 空间'
                              '均匀网格采样（只改选点，不动傅里叶聚合）')
