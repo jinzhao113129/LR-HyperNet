@@ -1571,3 +1571,42 @@ Codex 第二轮复审（接第一轮"暂不可放行 hyp_far"）逐条核验，�
 ### 状态
 - 代码层全绿，等 euc_near 跑完 → 3090 实跑 test_g16_memory.py（显存 PASS）→ 切 hyp_far；
 - HPC LR 全量路径代码已就绪，恢复时再做 __file__/hash/lorentz 断言现场核验。
+
+## 43. 固定选点全扫完 + rp1 方向修复 + learned scorer 方案（2026-10-23）
+
+### G16 五链对照（小样本快测，统一对比官方 60.6）
+
+| 链 | 选点语义 | 结果 |
+|---|---|---|
+| euc_near | 欧氏特征最近 | 59% ✅（唯一 work，追平 EMA 链 58.57） |
+| euc_far | 欧氏特征最远 | 44% 塌 |
+| hyp_far | 双曲最远 | 46% 塌 |
+| hyp_near | 双曲最近 | 44% 塌 |
+| rp1_scorer（修复版） | 特征最近 + 空间新颖 | 跑中（ep7=42.9%，早期不弱于 euc_near） |
+
+### 新增 hyp_near + 三个方向结论
+- hyp_near（双曲最近）补上（v2 映射/near_mode/断言/argparse/chain_flags/batch_for），
+  与 euc_near 严格对齐方向、只差距离度量。结果塌 44% < euc_near 59%——
+  **双曲距离选点被证伪**。
+- "最远"方向被证伪（euc_far 44 / hyp_far 46）；"最近"方向唯一 work（euc_near 59）。
+- 方向问题的根：原文 Global Feature-KNN 语义是"特征最近"，我们最初 topk largest=True
+  选最远，翻方向后 euc_near 修好。
+
+### rp1_scorer 方向 bug 修复（feature 项取负）
+- rp1_scorer 原实现 `score = 特征距离 + λ×空间新颖性` 取 largest = 选"特征最远"，
+  与 euc_far 同源反方向（旧版实测塌 25.59%）。
+- 修复：feature 项取负（`-距离 + λ×novelty`，距离小=相似=得分高），novelty 保持正。
+  块内 + 候选并集两处，fork_ai2 + code 两份同步。
+- 修复版 rp1v2 从零重跑（换 log_dir 避开旧 checkpoint），早期 39.3→42.9 爬、未塌。
+
+### core idea 1：learned scorer 方案（固定选点扫完后转向）
+- 学长定位：G16 的"怎么选这 16 点"是 core idea 1。
+- 论文地图 notes/learned_remote_selector_survey_20261023.md：RP1 原文 + 7 篇
+  可微选点论文（CS-Net/SampleNet/SOFT/ReparamSubset/SetTransformer/AttentionLiDAR/GRAPES），
+  全部核验真实。关键结论：SOFT 把 top-k 建模成 n→2 熵正则 OT，代价矩阵 n×2 不爆显存。
+- 落地方案 notes/learned_remote_selector_plan_20261023.md：可学习 scorer + 可微 top-k
+  （新增 g16_treatment='learned'，分三阶段：scorer+硬topk → 软top-k → 软加权聚合）。
+
+### 平台变更
+- 租约 124 到期 → 换 191（gpu-server-3 磁盘在，数据/checkpoint/环境全保留，setup 幂等）。
+- hyp_near/rp1_scorer 均从 checkpoint 续跑或换目录重跑。
