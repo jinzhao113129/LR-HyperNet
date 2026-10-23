@@ -1070,7 +1070,7 @@ class FECNet(nn.Module):
             if use_remote_g16:
                 # 16 点远程选择（论文灵魂）：v2 的 LocalRemoteGrouper（含六处理分派），
                 # g16_treatment 选六种选点准则之一（random/spatial_fixed/euc_far/
-                # euc_near/hyp_far/rp1_scorer，空串=原 topk 双曲行为）
+                # euc_near/hyp_far/hyp_near/rp1_scorer，空串=原 topk 双曲行为）
                 local_grouper = LocalRemoteGrouperV2(self.feature_list[i], self.group_number[i],
                                                      kneighbors=24, remote_g=16,
                                                      use_xyz=True, normalize="center",
