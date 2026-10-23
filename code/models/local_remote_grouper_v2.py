@@ -211,10 +211,10 @@ class RemoteSelector(nn.Module):
         # 显式拦截。合法组合：hyp_far 才允许 use_hyperbolic；
         # rp1_scorer 才允许 use_rp1_selector；空 treatment 不受任何限制。
         if g16_treatment:
-            if use_hyperbolic and g16_treatment != 'hyp_far':
+            if use_hyperbolic and g16_treatment not in ('hyp_far', 'hyp_near'):
                 raise ValueError(
                     f"g16_treatment='{g16_treatment}' 与 use_hyperbolic_selector=True "
-                    f"冲突：六处理必须纯净——只有 hyp_far 走双曲选点。"
+                    f"冲突：六处理必须纯净——只有 hyp_far/hyp_near 走双曲选点。"
                     f"请去掉 --use_hyperbolic_selector。")
             if use_rp1_selector and g16_treatment != 'rp1_scorer':
                 raise ValueError(
@@ -226,7 +226,7 @@ class RemoteSelector(nn.Module):
         # 注册在 L252 检查构造参数 use_hyperbolic，导致 self.use_hyperbolic
         # 虽被覆写为 True 但 c 没注册（AttributeError: no attribute 'c'）。
         # 修法: g16_treatment 的 use_hyperbolic 映射在这里（最早处）完成。
-        if g16_treatment == 'hyp_far':
+        if g16_treatment in ('hyp_far', 'hyp_near'):
             use_hyperbolic = True  # 覆写构造参数——buffer 注册将看到 True
             if hyperbolic_type.lower() == 'poincare':
                 hyperbolic_type = 'lorentz'  # v3.1 推荐（数值稳定）
@@ -243,7 +243,7 @@ class RemoteSelector(nn.Module):
         self.div_lambda = div_lambda
         # ==== G16 六处理分派状态（空 treatment = 原行为完全不动）====
         # 六处理显式名（Codex 清单#1）: random / spatial_fixed / euc_far /
-        # euc_near / hyp_far / rp1_scorer。非空时激活分派+缓存生产。
+        # euc_near / hyp_far / hyp_near / rp1_scorer。非空时激活分派+缓存生产。
         self.g16_treatment = g16_treatment
         self.stage_idx = stage_idx
         # RNG 隔离（Codex 清单#4）: 每实例独立 Generator，
@@ -266,13 +266,15 @@ class RemoteSelector(nn.Module):
                 self.selector_mode = 'topk'
                 # use_hyperbolic/hyperbolic_type 已在 __init__ 开头映射
                 # （P0-1: buffer 注册之前——否则 c 不注册）
+            elif _t == 'hyp_near':
+                self.selector_mode = 'topk'   # near_mode 在 forward 翻方向（双曲最近）
             elif _t == 'rp1_scorer':
                 self.selector_mode = 'topk'
                 self.use_rp1_selector = True        # 特征距离+λ×空间新颖性
             else:
                 raise ValueError(
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
-                    f"euc_far/euc_near/hyp_far/rp1_scorer，空串=原行为）")
+                    f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer，空串=原行为）")
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
@@ -481,7 +483,7 @@ class RemoteSelector(nn.Module):
         # ==== G16 分派激活（空 treatment 时全部跳过,原行为不动）====
         g16_on = bool(getattr(self, 'g16_treatment', ''))
         # euc_near: 方向翻转一行（原文 KNN 语义,Codex 清单#5）
-        near_mode = g16_on and self.g16_treatment == 'euc_near'
+        near_mode = g16_on and self.g16_treatment in ('euc_near', 'hyp_near')
         # Codex 第三轮 P0-2 修复：惰性创建一次、持续复用同一 generator——
         # 不再每次 forward 新建 + manual_seed（那会把随机基线变成逐调用
         # 固定，同输入两次调用结果相同，统计语义被破坏）。实例级属性
@@ -1093,8 +1095,8 @@ class LocalRemoteGrouper(nn.Module):
                                                          hyperbolic_type=hyperbolic_type)
         # ==== 逐 stage 集成断言（Codex G16 hyp_far 复审 P0-1）====
         # 防止"selector 走 lorentz 但 aggregator 回落 poincare"的分裂态。
-        # 仅 hyp_far 强校验（六处理中唯一走双曲距离选点的链）；空串=历史 topk 行为不拦。
-        if g16_treatment == 'hyp_far':
+        # 仅 hyp_far/hyp_near 强校验（六处理中走双曲距离选点的链）；空串=历史 topk 行为不拦。
+        if g16_treatment in ('hyp_far', 'hyp_near'):
             assert self.remote_selector.use_hyperbolic, \
                 f"[stage {stage_idx}] hyp_far 但 selector.use_hyperbolic=False"
             assert self.remote_selector.hyperbolic_type == 'lorentz', \
