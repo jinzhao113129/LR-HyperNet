@@ -106,7 +106,7 @@ def parse_args():
                         help='G16 profiling 触发概率（0<p<=1, Bernoulli）')
     parser.add_argument('--g16_treatment', type=str, default='',
                         help='当前六处理名（random/spatial_fixed/euc_far/euc_near/'
-                             'hyp_far/rp1_scorer——显式写入 h5 的 selector 字段）')
+                             'hyp_far/hyp_near/rp1_scorer——显式写入 h5 的 selector 字段）')
     parser.add_argument('--augment', type=int, default=0,
                         help='训练数据增强版本数（0=关闭；2=每样本再生成2个增强版本，数据×3）')
     parser.add_argument('--ema', type=float, default=0.0,
