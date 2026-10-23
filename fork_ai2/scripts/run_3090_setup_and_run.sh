@@ -48,6 +48,7 @@ chain_flags() {
     polar) echo "--polar_feature" ;;
     hclf) echo "--hyperbolic_classifier" ;;
     g16_hypfar) echo "--remote_g16 --g16_treatment hyp_far" ;;
+    g16_hypnear) echo "--remote_g16 --g16_treatment hyp_near" ;;
     g16_eucfar) echo "--remote_g16 --g16_treatment euc_far" ;;
     g16_eucnear) echo "--remote_g16 --g16_treatment euc_near" ;;
     g16_random) echo "--remote_g16 --g16_treatment random" ;;
@@ -64,7 +65,7 @@ chain_flags() {
 # 其余链 batch16 + accum2。返回 "<batch_size> <grad_accum>"。
 batch_for() {
   case "$1" in
-    g16_hypfar|g16_rp1|g16_eucnear) echo "8 4" ;;
+    g16_hypfar|g16_hypnear|g16_rp1|g16_eucnear) echo "8 4" ;;
     *) echo "16 2" ;;
   esac
 }
