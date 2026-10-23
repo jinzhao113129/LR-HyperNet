@@ -562,7 +562,11 @@ class RemoteSelector(nn.Module):
                     # 最小欧氏距离 [B,S,c]
                     chunk_novelty = self._spatial_novelty(
                         all_xyz[:, start:end, _xyz_cols].unsqueeze(1), local_nxyz)  # [B, S, c]
-                    chunk_dist = chunk_dist + self.rp1_lambda * chunk_novelty
+                    # RP1 原文语义：好远程点 = 特征相关（最近）+ 空间远程（新颖）。
+                    # feature 项取负（距离小=相似=得分高），novelty 保持正（远=好）。
+                    # 方向修复 2026-10-23：原 chunk_dist 取正=选"最不相似"，与
+                    # 原文 Global Feature-KNN（特征最近）相反，已翻负。
+                    chunk_dist = -chunk_dist + self.rp1_lambda * chunk_novelty
                 if global_anchor is not None:
                     # PVAG 式全局吸收：混合"到中心点"与"到全局锚点"的距离
                     if self.use_hyperbolic:
@@ -621,7 +625,8 @@ class RemoteSelector(nn.Module):
                 # RP1：候选并集上同样加上空间新颖性，保持与块内一致的得分定义
                 # （Codex 第三轮补充#4+第四轮记录#1: 二维 XY 仅限 rp1_scorer）
                 cand_nxyz = index_points(all_xyz, cand_idx)[..., _xyz_cols]  # [B,S,M,2/3]
-                cand_dist = cand_dist + self.rp1_lambda * self._spatial_novelty(
+                # 与块内一致：feature 项取负（特征最近=相关），novelty 保持正。
+                cand_dist = -cand_dist + self.rp1_lambda * self._spatial_novelty(
                     cand_nxyz, local_nxyz)
             if global_anchor is not None:
                 if self.use_hyperbolic:
