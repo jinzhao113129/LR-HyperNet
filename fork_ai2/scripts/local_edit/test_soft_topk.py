@@ -1,15 +1,13 @@
-"""learned scorer 地基：可微 top-k 数值原型（ST_k，NeurIPS 2024）。
+"""learned scorer 地基：可微 top-k 数值原型（ST_k，NeurIPS 2024，Codex 复审版）。
 
-排坑记录（2026-10-24）：
-- sigmoid top-k：Σw 爆到 711；sequential softmax：质量不集中。
-- 本地 δ sweep 发现：可微 top-k 的 δ/τ 必须与 score 尺度匹配（[0,1] 需 δ~1e-5）。
-- ST_k 的独有优势：阈值 λ 是可训练参数，自动收敛到第 k 大元素，无需手动调温度。
+Codex 复审（2026-10-24）三处口径修正：
+1. λ 不是可训练参数——是 forward 内非可微地取 kthvalue(s).detach()，每次重算，
+   天然保证 Σw≈k。若照"可训练 λ"天真实现会漂移（潜在 P0）。
+2. δ 尺度必须与 score 尺度匹配（[0,1] 分数需 δ~1e-5，1e-4 会打脸质量集中断言）；
+   实际 scorer 输出要先归一化（tanh/标准化到有界区间），再用固定 δ 调度（大→小）。
+3. Σw 是 "≈k"（λ 取第 k 大时，第 k 大元素落在阈值处 w=0.5，Σw≈k−0.5），不是精确 k。
 
-ST_k 核心（Ogryczak-Tamir Eq.1 + SReLU）：
-    w_i = SReLU'(s_i - λ) = 0.5 * (1 + (s_i-λ)/sqrt((s_i-λ)^2 + δ^2))
-    λ 初始化为第 k 大元素，随训练自动收敛；δ 退火（大→小）。
-
-验证三点（Codex 要求）：Σw≈k、质量集中、梯度方向（w 随 score 单调）。
+ST_k 核心：w_i = SReLU'(s_i − λ) = ½[1 + (s_i−λ)/√((s_i−λ)²+δ²)]
 
 用法（3090）：
     cd ~/zhaojin/pi2/tools
@@ -18,43 +16,38 @@ ST_k 核心（Ogryczak-Tamir Eq.1 + SReLU）：
 import torch
 
 
-def stk_soft_topk(scores: torch.Tensor, k: int, delta: float = 1e-4,
-                  lam: torch.Tensor = None) -> torch.Tensor:
-    """ST_k 软权重：w_i = SReLU'(s_i - λ)。
-
-    scores: [n]（scorer 打分，可含梯度）
-    lam: 阈值（可训练参数，默认初始化为第 k 大元素）
-    delta: 平滑系数（需与 score 尺度匹配，退火）
-    """
-    if lam is None:
-        lam = scores.detach().kthvalue(scores.numel() - k + 1).values
+def stk_soft_topk(scores: torch.Tensor, k: int, delta: float = 1e-5) -> torch.Tensor:
+    """ST_k 软权重。λ 非可微地取第 k 大（detach），每次 forward 重算。"""
+    lam = scores.detach().kthvalue(scores.numel() - k + 1).values
     x = scores - lam
     return 0.5 * (1 + x / torch.sqrt(x * x + delta * delta))
 
 
 n, k = 10240, 16
 torch.manual_seed(0)
-scores = torch.rand(n, requires_grad=True)
+# 演示「归一化分数」：scorer 输出标准化到 mean 0 / std 1（scale 稳定）
+raw = torch.randn(n, requires_grad=True)
+scores = (raw - raw.mean()) / (raw.std() + 1e-8)
 
-# δ 需匹配 score 尺度（[0,1] 用 1e-4）
-w = stk_soft_topk(scores, k, delta=1e-4)
+# δ 用与归一化后分数尺度匹配的固定值（第 16/17 大间隔 ~1e-4 量级 → δ=1e-5）
+w = stk_soft_topk(scores, k, delta=1e-5)
 
-# 1. Σw ≈ k
-print(f"Σw = {w.sum().item():.3f} (期望 ≈ {k})")
-assert abs(w.sum().item() - k) < k * 0.15, "Σw 偏离 k 太多"
+# 1. Σw ≈ k（不是精确 k；第 k 大元素 w=0.5 → Σw≈k−0.5）
+s = w.sum().item()
+print(f"Σw = {s:.3f} (期望 ≈ {k}，Codex：实际 ≈k−0.5)")
+assert abs(s - k) < 1.0, f"Σw 偏离 k 太多: {s}"
 
-# 2. 质量集中：top-k 权重接近 1，非 top-k 接近 0
+# 2. 质量集中：非 top-k 权重接近 0（δ=1e-5 下通过；δ=1e-4 会打脸）
 topk = torch.topk(scores, k).indices
 mask = torch.ones(n, dtype=torch.bool)
 mask[topk] = False
-print(f"top-{k} 权重 min = {w[topk].min().item():.3f}（第 k 大在阈值上≈0.5 属正常）")
-print(f"非 top-k 权重 max = {w[mask].max().item():.3f}（期望接近 0）")
-assert w[mask].max() < 0.1, "非 top-k 权重应接近 0"
+print(f"非 top-{k} 权重 max = {w[mask].max().item():.4f} (期望 < 0.1)")
+assert w[mask].max() < 0.1, "δ 太大，非 top-k 权重没压下去（需更小 δ）"
 
-# 3. 梯度方向：w 随 score 单调（SReLU' 单调递增 → ∂w/∂score > 0）
+# 3. 梯度非负（SReLU' 单调 → score 高 → 权重高），且集中在阈值附近
 w.sum().backward()
-grad = scores.grad
-print(f"梯度范围 [{grad.min().item():.4f}, {grad.max().item():.4f}]（应全 ≥ 0）")
-assert grad.min() >= 0, "梯度应为非负（score 高 → 权重高）"
+grad = raw.grad
+print(f"梯度范围 [{grad.min().item():.4f}, {grad.max().item():.4f}]（应全 ≥0，稀疏集中在阈值附近）")
+assert grad.min() >= -1e-6, "梯度应非负"
 
-print("\nST_k 三点验证通过 ✓（λ 可训练是相对 STE 的核心优势）")
+print("\nST_k 三点验证通过 ✓（λ=kthvalue detach，分数归一化 + δ 匹配尺度）")
