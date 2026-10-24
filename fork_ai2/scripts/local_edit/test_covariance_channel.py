@@ -1,10 +1,11 @@
 """core idea 2 协方差通道数值自检（在 3090 上跑，有 torch + models）。
 
-验证 FECNet._covariance_density_channels：
+验证 FECNet._covariance_density_channels 的核心逻辑（用干净的同体素数据，避免
+随机点混入）：
 1. 输出 shape = [B, E, N]（covariance 3 + density 1 = 4 维）
-2. 数值有限（无 NaN/Inf），归一化后 cov 在 [0,1]
-3. count<3 门控：单点体素协方差归零
-4. 手算对照：构造"y 方向拉长"的体素，σyy 应 > σxx；密度 = log1p(count)
+2. 5 点同体素、x 固定 y 展开 → σxx≈0、σyy>0、σxy≈0（手算对照）
+3. 密度 = log1p(count)
+4. count<3 门控：单点体素协方差归零
 
 用法（3090 code-server 终端）：
     cd ~/zhaojin/pi2/tools
@@ -16,46 +17,44 @@ import torch
 sys.path.insert(0, ".")
 from models.FECNet import FECNet
 
+# bins=2 → 体素宽 0.5；5 点全落进同一体素（x=0.2→列0，y 均<0.5→行0）
 m = FECNet(num_classes=101, use_covariance_channel=True,
-           use_density_channel=True, density_bins=8)
+           use_density_channel=True, density_bins=2)
 
-B, N = 2, 200
-torch.manual_seed(0)
-xyz = torch.rand(B, N, 4)  # x,y 在 [0,1]
-
-# 造一个已知分布：batch 0 的前 5 个点放同一体素，x 固定（σxx 小）、y 沿轴展开（σyy 大）
-xyz[0, 0:5, 1] = 0.2
-xyz[0, 0:5, 2] = torch.linspace(0.1, 0.5, 5)
+B, N = 1, 5
+xyz = torch.zeros(B, N, 4)
+xyz[0, :, 0] = 0.5   # t 任意
+xyz[0, :, 1] = 0.2   # x 固定 → σxx≈0
+xyz[0, :, 2] = torch.tensor([0.10, 0.20, 0.30, 0.40, 0.45])  # y 展开（<0.5 同行）→ σyy>0
+xyz[0, :, 3] = 1.0   # p 任意
 
 out = m._covariance_density_channels(xyz)  # [B, 4, N]
 print("out shape:", tuple(out.shape))
 assert out.shape == (B, 4, N), f"shape 错: {out.shape}"
 
-cov = out[:, 0:3, :]   # [B, 3, N] = σxx, σyy, σxy
-dens = out[:, 3:4, :]  # [B, 1, N] = log1p(count)
+sxx, syy, sxy = out[0, 0, 0].item(), out[0, 1, 0].item(), out[0, 2, 0].item()
+dens = out[0, 3, 0].item()
 
-# 1. 有限性
+print(f"σxx={sxx:.5f}（期望≈0，x 固定）")
+print(f"σyy={syy:.5f}（期望>0，y 展开）")
+print(f"σxy={sxy:.5f}（期望≈0，x 固定无相关）")
+print(f"density={dens:.5f}（期望 log1p(5)={float(torch.log1p(torch.tensor(5.0))):.5f}）")
+
 assert torch.isfinite(out).all(), "有 NaN/Inf"
+assert abs(sxx) < 1e-5, f"σxx 应≈0，实际 {sxx}"
+assert syy > 0, f"σyy 应>0，实际 {syy}"
+assert syy > sxx, "σyy 应 > σxx"
+assert abs(sxy) < 1e-5, f"σxy 应≈0，实际 {sxy}"
+assert abs(dens - float(torch.log1p(torch.tensor(5.0)))) < 1e-3, f"密度错: {dens}"
 
-# 2. 归一化后 cov 在 [0,1]（σxy 可能为负，取绝对值看范围）
-print("cov_xx/yy 范围:", cov[:, 0:2].min().item(), cov[:, 0:2].max().item())
-assert cov[:, 0:2].min() >= 0.0 and cov[:, 0:2].max() <= 1.0 + 1e-3, "σxx/σyy 归一化越界"
-assert cov[:, 2].abs().max() <= 1.0 + 1e-3, "σxy 归一化越界"
-
-# 3. y 方向拉长的 5 点体素：σyy > σxx
-sxx, syy = out[0, 0, 0].item(), out[0, 1, 0].item()
-print(f"5点体素点0: σxx={sxx:.4f} σyy={syy:.4f} (y 拉长应 σyy>σxx)")
-assert syy > sxx, "y 方向拉长应 σyy > σxx"
-
-# 4. 密度 = log1p(count)；5 点体素 count=5
-d0 = out[0, 3, 0].item()
-expect = float(torch.log1p(torch.tensor(5.0)).item())
-print(f"5点体素点0: density={d0:.4f} (期望 log1p(5)={expect:.4f})")
-assert abs(d0 - expect) < 1e-3, f"密度错: {d0} vs {expect}"
-
-# 5. count<3 门控：找一个单点体素，其 cov 应为 0（有效门控 × 方差 0 = 0）
-#    随机点大部分是单点体素，其 σxx+σyy=0 → 归一化后为 0（已乘 valid）
-single = (out[1, 0] == 0.0) | (out[1, 1] == 0.0)  # batch 1 里 σxx 或 σyy 为 0 的点
-print("batch1 单点体素占比（σxx 或 σyy=0）:", single.float().mean().item())
+# count<3 门控：单点体素（N=1）协方差应归零
+m2 = FECNet(num_classes=101, use_covariance_channel=True,
+            use_density_channel=False, density_bins=4)
+xyz1 = torch.zeros(1, 1, 4)
+xyz1[0, 0, 1] = 0.3
+xyz1[0, 0, 2] = 0.4
+out1 = m2._covariance_density_channels(xyz1)  # [1, 3, 1]
+print(f"单点体素 cov: {out1[0, :, 0].tolist()}（期望全 0，count<3 门控）")
+assert out1[0, :, 0].abs().max() < 1e-6, "单点体素协方差应归零"
 
 print("\n全部断言通过 ✓")
