@@ -145,6 +145,19 @@ def stk_soft_topk(scores, k, delta=1e-3):
     return 0.5 * (1 + x / torch.sqrt(x * x + delta * delta))
 
 
+def gumbel_ste_topk(scores, k, tau=1.0):
+    """STE + Gumbel-softmax（学长推荐，learned scorer 可微 top-k 备选）。
+
+    前向：硬 top-k one-hot（质量集中精确，Σw=k）；反向：Gumbel-softmax 软梯度
+    （稠密，所有点都有梯度，scorer 学得快，解决 ST_k 稀疏梯度冷启动慢的问题）。
+    """
+    topk = torch.topk(scores, k, dim=-1).indices  # [B,S,k]
+    hard = torch.zeros_like(scores).scatter_(-1, topk, 1.0)  # 前向硬 one-hot
+    gumbel = -torch.log(-torch.log(torch.rand_like(scores).clamp(min=1e-8)))
+    soft = torch.softmax((scores + gumbel) / tau, dim=-1) * k  # 反向稠密梯度
+    return hard - soft.detach() + soft
+
+
 class RemoteSelector(nn.Module):
     """远程邻居选择器（第一版：特征距离 top-k，不做 learned scorer）。
 
@@ -330,10 +343,8 @@ class RemoteSelector(nn.Module):
         novelty = self._spatial_novelty(cand_xy, local_xy)  # [B,S,M]
         scorer_in = torch.cat([diff, novelty.unsqueeze(-1)], dim=-1)  # [B,S,M,C+1]
         scores = self.learned_scorer(scorer_in).squeeze(-1)  # [B,S,M]
-        # 3. 归一化分数 + ST_k 软权重（δ 匹配归一化后尺度）
-        scores_norm = (scores - scores.mean(dim=-1, keepdim=True)) / \
-                      (scores.std(dim=-1, keepdim=True) + 1e-8)
-        w = stk_soft_topk(scores_norm, G, self.learned_delta)  # [B,S,M]
+        # 3. Gumbel STE（学长推荐）：前向硬 top-k，反向 Gumbel-softmax 稠密梯度
+        w = gumbel_ste_topk(scores, G, tau=1.0)  # [B,S,M]，前向 one-hot、反向稠密
         return w, cand_idx
 
     def _hyp_dist_chunk(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
