@@ -988,7 +988,10 @@ class FECNet(nn.Module):
                  use_event_mamba_ssm: bool = False,
                  use_spike_time_enc: bool = False,
                  use_scale_norm_fps: bool = False,
-                 use_hsel_scaled_coords: bool = False):
+                 use_hsel_scaled_coords: bool = False,
+                 use_covariance_channel: bool = False,
+                 use_density_channel: bool = False,
+                 density_bins: int = 32):
         super().__init__()
         _enc_flags = [use_time_enc, use_kda, use_spike_time_enc]
         if sum(_enc_flags) > 1:
@@ -1036,6 +1039,11 @@ class FECNet(nn.Module):
         self.use_polar_feature = use_polar_feature
         self.use_event_mamba_ssm = use_event_mamba_ssm
         self.use_spike_time_enc = use_spike_time_enc
+        # 高斯参数化通道（core idea 2，4DGS 迁移）：covariance（2 阶矩）与
+        # density（0 阶矩）并存不互斥（迹≠密度，Codex 复审 2026-10-24）。
+        self.use_covariance_channel = use_covariance_channel
+        self.use_density_channel = use_density_channel
+        self.density_bins = density_bins
         if use_hyperbolic_fusion:
             self.hyper_fusion_list = nn.ModuleList()
         # 官方 N-Caltech101 配置（与 best_checkpoint 维度一致）
@@ -1059,6 +1067,11 @@ class FECNet(nn.Module):
             embed_in_dim = 12  # xy+t+p+8 sin/cos
         else:
             embed_in_dim = 4
+        # 高斯参数化通道：covariance 加 [σxx,σyy,σxy] 3 维，density 加 1 维
+        if use_covariance_channel:
+            embed_in_dim += 3
+        if use_density_channel:
+            embed_in_dim += 1
         self.embed_dim = Linear1Layer(embed_in_dim, self.feature_list[0], 1, use_group_norm=use_group_norm)
         self.group_conv_list = nn.ModuleList()
         self.aggregation_list = nn.ModuleList()
@@ -1171,6 +1184,49 @@ class FECNet(nn.Module):
             # 方向/半径分离（Polar FC 思路，欧氏对照）：同挂 embed 后，单模块
             self.polar_feature = PolarFeatureLayer(self.feature_list[0])
 
+    def _covariance_density_channels(self, xyz: torch.Tensor) -> torch.Tensor:
+        """体素协方差 [σxx,σyy,σxy]（2 阶矩）+ 体素密度（0 阶矩）通道。
+
+        core idea 2（4DGS 高斯参数化迁移，Codex 复审 2026-10-24）。
+        xyz: [B, N, 4] (t,x,y,p)，x=xyz[...,1]、y=xyz[...,2] 归一化到 [0,1]。
+        空间分 bins×bins 体素，每体素算 x,y 协方差的 3 个归一化原始项 + 点计数
+        密度。迹≠密度（0 阶 vs 2 阶），两者互补并存。count<3 门控 + eps 归一化，
+        训练/推理一致。返回 [B, E, N]，E = 3(若 covariance) + 1(若 density)。
+        """
+        B, N, _ = xyz.shape
+        bins = self.density_bins
+        x = xyz[..., 1]  # [B, N]
+        y = xyz[..., 2]  # [B, N]
+        xi = (x * bins).long().clamp(0, bins - 1)
+        yi = (y * bins).long().clamp(0, bins - 1)
+        vox = xi * bins + yi  # [B, N] 展平体素索引
+
+        ones = torch.ones_like(x)
+        count = torch.zeros(B, bins * bins, device=x.device, dtype=torch.float32).scatter_add_(1, vox, ones)
+        cnt = count.clamp(min=1.0)
+        mean_x = torch.zeros_like(count).scatter_add_(1, vox, x) / cnt
+        mean_y = torch.zeros_like(count).scatter_add_(1, vox, y) / cnt
+        cov_xx = torch.zeros_like(count).scatter_add_(1, vox, x * x) / cnt - mean_x * mean_x
+        cov_yy = torch.zeros_like(count).scatter_add_(1, vox, y * y) / cnt - mean_y * mean_y
+        cov_xy = torch.zeros_like(count).scatter_add_(1, vox, x * y) / cnt - mean_x * mean_y
+
+        # Codex P1-2：归一化 1/(σxx+σyy+eps)，count<3 门控置 0
+        eps = 1e-4
+        norm = 1.0 / (cov_xx + cov_yy + eps)
+        valid = (count >= 3).float()
+        cov_xx = cov_xx * norm * valid
+        cov_yy = cov_yy * norm * valid
+        cov_xy = cov_xy * norm * valid
+
+        extra = []
+        if self.use_covariance_channel:
+            extra.append(torch.stack(
+                [cov_xx.gather(1, vox), cov_yy.gather(1, vox), cov_xy.gather(1, vox)],
+                dim=1))  # [B, 3, N]
+        if self.use_density_channel:
+            extra.append(count.clamp(min=0.0).gather(1, vox).log1p().unsqueeze(1))  # [B, 1, N]
+        return torch.cat(extra, dim=1)  # [B, E, N]
+
     def forward(self, x: torch.Tensor):
         xyz = x.permute(0, 2, 1)
         batch_size, _, _ = x.size()
@@ -1192,6 +1248,11 @@ class FECNet(nn.Module):
             # 输入 (x,y,p + 16) = 19 维
             kda_feat = self.kda_point_enc(xyz)                  # [B, N, 16]
             embed_in = torch.cat([xyz[..., 1:4], kda_feat], dim=-1).permute(0, 2, 1)  # [B, 19, N]
+        # 高斯参数化通道（core idea 2）：体素协方差 + 密度在 embed 输入层叠加，
+        # 不换 backbone（FPS/KNN/频域聚合全不动）。
+        if self.use_covariance_channel or self.use_density_channel:
+            extra = self._covariance_density_channels(xyz)  # [B, E, N]
+            embed_in = torch.cat([embed_in, extra], dim=1)
         x = self.embed_dim(embed_in)
         x = x.permute(0, 2, 1)
         if self.use_hyperbolic_radial:
