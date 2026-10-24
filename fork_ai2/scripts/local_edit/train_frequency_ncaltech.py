@@ -89,6 +89,14 @@ def parse_args():
                         help='G16 选点准则（需与 --remote_g16 同开）：空串=原 topk'
                              '双曲行为；random/spatial_fixed/euc_far/euc_near/hyp_far/'
                              'hyp_near/rp1_scorer（hyp_far=双曲最远，hyp_near=双曲最近）')
+    parser.add_argument('--covariance_channel', action='store_true', default=False,
+                        help='高斯参数化通道（core idea 2）：每点加体素协方差 [σxx,σyy,σxy]'
+                             '3 维（2 阶矩，编码局部形状/方向），embed 输入 4→7，不换 backbone')
+    parser.add_argument('--density_channel', action='store_true', default=False,
+                        help='体素密度通道（0 阶矩）：每点加所在体素事件数 log1p 1 维。'
+                             '与 --covariance_channel 并存不互斥（迹≠密度）')
+    parser.add_argument('--density_bins', type=int, default=32,
+                        help='covariance/density 通道的空间体素边长（默认 32×32）')
     parser.add_argument('--rp1_selector', action='store_true', default=False,
                         help='RP1 spatial-uniform 选点：group center 由 FPS 改为 x,y 空间'
                              '均匀网格采样（只改选点，不动傅里叶聚合）')
@@ -612,7 +620,10 @@ def main(args):
                               use_polar_feature=args.polar_feature,
                               use_event_mamba_ssm=args.event_mamba_ssm,
                               use_scale_norm_fps=args.scale_norm_fps,
-                              use_hsel_scaled_coords=args.hsel_scaled_coords)
+                              use_hsel_scaled_coords=args.hsel_scaled_coords,
+                              use_covariance_channel=args.covariance_channel,
+                              use_density_channel=args.density_channel,
+                              density_bins=args.density_bins)
     criterion = cal_loss
     classifier.apply(inplace_relu)
 
