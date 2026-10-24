@@ -133,6 +133,18 @@ def lorentz_distance(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor, eps: flo
 # 远程邻居选择器
 # ============================================================================
 
+def stk_soft_topk(scores, k, delta=1e-3):
+    """ST_k 软权重（NeurIPS 2024，learned scorer 的可微 top-k）。
+
+    w_i = SReLU'(s_i - λ) = 0.5 * (1 + (s_i-λ)/sqrt((s_i-λ)^2 + δ^2))
+    λ = 第 k 大元素（非可微 kthvalue + detach，每次 forward 重算），Σw ≈ k。
+    Codex 复审：λ 不是可训练参数；δ 需与 score 尺度匹配（先归一化 scorer 分数）。
+    """
+    lam = scores.detach().kthvalue(scores.shape[-1] - k + 1, dim=-1, keepdim=True).values
+    x = scores - lam
+    return 0.5 * (1 + x / torch.sqrt(x * x + delta * delta))
+
+
 class RemoteSelector(nn.Module):
     """远程邻居选择器（第一版：特征距离 top-k，不做 learned scorer）。
 
@@ -165,7 +177,11 @@ class RemoteSelector(nn.Module):
                  # ==== G16 六处理分派（2026-10-15, Codex 审查版）====
                  g16_treatment: str = "",
                  stage_idx: int = 0,
-                 rng_seed: int = 42):
+                 rng_seed: int = 42,
+                 # ==== learned scorer（core idea 1，2026-10-24 Codex 复审）====
+                 channel: int = 64,
+                 learned_M: int = 256,
+                 learned_delta: float = 1e-3):
         """
         Args:
             remote_g: 每个中心点选取的远程邻居数 G
@@ -271,13 +287,54 @@ class RemoteSelector(nn.Module):
             elif _t == 'rp1_scorer':
                 self.selector_mode = 'topk'
                 self.use_rp1_selector = True        # 特征距离+λ×空间新颖性
+            elif _t == 'learned':
+                # 可学习远程选点（core idea 1）：无偏候选池 + 可学习 scorer + ST_k 软 top-k。
+                # 打分走 candidate−centroid + novelty 标量（Codex P0-2：平移不变 + 保空间信号）。
+                self.selector_mode = 'topk'
+                self.learned_M = learned_M
+                self.learned_delta = learned_delta
+                self.learned_scorer = nn.Sequential(
+                    nn.Linear(channel + 1, channel),
+                    nn.GELU(),
+                    nn.Linear(channel, 1))
             else:
                 raise ValueError(
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
-                    f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer，空串=原行为）")
+                    f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/learned，空串=原行为）")
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
+
+    def _learned_select(self, centroid_feat, all_feat, local_idx, all_xyz, B, S, C, N, G):
+        """learned scorer：无偏候选池 + 可学习 scorer + ST_k 软 top-k（core idea 1）。
+
+        返回 (w, cand_idx)：w [B, S, M] 软权重（Σw≈G，可微），cand_idx [B, S, M] 候选索引。
+        训练用软权重加权聚合（梯度回流 scorer），推理硬 top-k。
+        Codex 复审（2026-10-24）：M=256、每中心点独立采样、per-epoch 重采（RNG 固定 seed）、
+        scorer 输入 candidate−centroid + novelty 标量。
+        """
+        M = self.learned_M
+        K = local_idx.shape[-1]
+        _g16_rng = self._g16_rng_inst
+        # 1. 无偏采样候选（no_grad：离散采样不产生梯度），多采 K 缓冲排除 local
+        with torch.no_grad():
+            cand = torch.randint(0, N, (B, S, M + K), device=all_feat.device, generator=_g16_rng)
+            is_local = (cand.unsqueeze(-1) == local_idx.unsqueeze(-2)).any(-1)  # [B,S,M+K]
+            cand = cand.masked_fill(is_local, N)  # local 标 N（越界值，排最后）
+            cand_idx = cand.sort(dim=-1).values[..., :M]  # 取前 M 个非 local
+        # 2. scorer 打分（可微，在 no_grad 外）
+        cand_feat = index_points(all_feat, cand_idx)  # [B, S, M, C]
+        diff = cand_feat - centroid_feat.unsqueeze(-2)  # candidate−centroid [B,S,M,C]
+        cand_xy = index_points(all_xyz, cand_idx)[..., 1:3]  # [B,S,M,2] XY
+        local_xy = index_points(all_xyz, local_idx)[..., 1:3]  # [B,S,K,2] XY
+        novelty = self._spatial_novelty(cand_xy, local_xy)  # [B,S,M]
+        scorer_in = torch.cat([diff, novelty.unsqueeze(-1)], dim=-1)  # [B,S,M,C+1]
+        scores = self.learned_scorer(scorer_in).squeeze(-1)  # [B,S,M]
+        # 3. 归一化分数 + ST_k 软权重（δ 匹配归一化后尺度）
+        scores_norm = (scores - scores.mean(dim=-1, keepdim=True)) / \
+                      (scores.std(dim=-1, keepdim=True) + 1e-8)
+        w = stk_soft_topk(scores_norm, G, self.learned_delta)  # [B,S,M]
+        return w, cand_idx
 
     def _hyp_dist_chunk(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
         """分块双曲距离计算。
@@ -526,6 +583,10 @@ class RemoteSelector(nn.Module):
         if global_anchor is not None:
             if global_anchor.dim() == 1:
                 global_anchor = global_anchor.unsqueeze(0).unsqueeze(0).expand(B, S, -1)
+        # ==== learned scorer 分支（core idea 1）：无偏池 + scorer + ST_k 软 top-k ====
+        if g16_on and self.g16_treatment == 'learned':
+            return self._learned_select(centroid_feat, all_feat, local_idx, all_xyz,
+                                        B, S, C, N, G)
         # 选择只产生离散索引，无需梯度；no_grad 避免距离矩阵挂计算图浪费显存
         with torch.no_grad():
             topk_list = []
@@ -1092,7 +1153,8 @@ class LocalRemoteGrouper(nn.Module):
                                               stage_idx=stage_idx,
                                               rng_seed=g16_rng_seed,
                                               selector_mode=selector_mode,
-                                              div_lambda=div_lambda)
+                                              div_lambda=div_lambda,
+                                              channel=channel)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
         else:
@@ -1220,38 +1282,47 @@ class LocalRemoteGrouper(nn.Module):
             _g16_sink.clear()  # 开头清：兜底 profiling off 时的上次残留
             if hasattr(self.remote_selector, '_g16_sink'):
                 self.remote_selector._g16_sink = _g16_sink
-        remote_idx = self.remote_selector(centroid_feat, points, idx, anchor,
-                                          xytp[:, :, 0:3])  # [B, S, G]
-        # selector 缓存的记录里补填 centroid（fps_idx 只在 grouper 层可见）
-        if _g16_sink is not None and len(_g16_sink) > 0:
-            rec = _g16_sink[-1]
-            if rec.get('centroid') is None and rec.get('stage') == getattr(
-                    self.remote_selector, 'stage_idx', None):
-                rec['centroid'] = fps_idx.detach()
-                # xytp 用本 stage 完整 4 通道（含 p）——profile agent 吃 [B,N,4]
-                rec['xytp'] = xytp.detach()
-        remote_points = index_points(points, remote_idx)               # [B, S, G, C]
-        if self.remote_kda_enc is not None:
-            # 远程 KDA 时间编码（EventMamba 启发）：残差加法同局部 KDA 接法，
-            # KDA 内部按时间戳自动排序，恢复远程点间的时序因果关系
-            remote_xytp = index_points(xytp, remote_idx)               # [B, S, G, 4]
-            remote_points = remote_points + self.remote_kda_enc(
-                remote_points, remote_xytp[..., 0:1])                  # [B, S, G, C]
-        # ---- stochastic depth：训练时以 p_drop 概率逐样本跳过双曲远程聚合支路 ----
-        # 展平为 [M, G, C]（M = B*S，每个 FPS 组独立伯努利），跳过的组直接用
-        # 残差 x.mean(dim=1)（组均值）代替 hyper_agg 输出；推理（self.training=False）
-        # 时不跳过。keep mask [M,1] 与 [M,C] 广播。
-        p_drop = self.remote_stochastic_depth
-        if self.training and p_drop > 0.0:
-            G, Cc = remote_points.shape[2], remote_points.shape[3]
-            M = B * S
-            flat = remote_points.reshape(M, G, Cc)                     # [M, G, C]
-            agg = self.hyper_agg(flat.unsqueeze(1)).squeeze(1)         # [M, C]
-            residual = flat.mean(dim=1)                                # [M, C]
-            keep = (torch.rand(M, 1, device=flat.device, dtype=flat.dtype) > p_drop)
-            remote_feat = torch.where(keep, agg, residual).reshape(B, S, -1)  # [B, S, C]
+        _learned = getattr(self.remote_selector, 'g16_treatment', '') == 'learned'
+        if _learned:
+            # learned scorer：软权重 w [B,S,M] + 候选索引 cand_idx [B,S,M] → 软加权聚合
+            # （梯度回流 scorer，推理可退化为硬 top-k）
+            w, cand_idx = self.remote_selector(centroid_feat, points, idx, anchor,
+                                               xytp[:, :, 0:3])
+            cand_points = index_points(points, cand_idx)               # [B, S, M, C]
+            remote_feat = torch.einsum('bsm,bsmc->bsc', w, cand_points)  # [B, S, C]
         else:
-            remote_feat = self.hyper_agg(remote_points)                # [B, S, C]
+            remote_idx = self.remote_selector(centroid_feat, points, idx, anchor,
+                                              xytp[:, :, 0:3])  # [B, S, G]
+            # selector 缓存的记录里补填 centroid（fps_idx 只在 grouper 层可见）
+            if _g16_sink is not None and len(_g16_sink) > 0:
+                rec = _g16_sink[-1]
+                if rec.get('centroid') is None and rec.get('stage') == getattr(
+                        self.remote_selector, 'stage_idx', None):
+                    rec['centroid'] = fps_idx.detach()
+                    # xytp 用本 stage 完整 4 通道（含 p）——profile agent 吃 [B,N,4]
+                    rec['xytp'] = xytp.detach()
+            remote_points = index_points(points, remote_idx)               # [B, S, G, C]
+            if self.remote_kda_enc is not None:
+                # 远程 KDA 时间编码（EventMamba 启发）：残差加法同局部 KDA 接法，
+                # KDA 内部按时间戳自动排序，恢复远程点间的时序因果关系
+                remote_xytp = index_points(xytp, remote_idx)               # [B, S, G, 4]
+                remote_points = remote_points + self.remote_kda_enc(
+                    remote_points, remote_xytp[..., 0:1])                  # [B, S, G, C]
+            # ---- stochastic depth：训练时以 p_drop 概率逐样本跳过双曲远程聚合支路 ----
+            # 展平为 [M, G, C]（M = B*S，每个 FPS 组独立伯努利），跳过的组直接用
+            # 残差 x.mean(dim=1)（组均值）代替 hyper_agg 输出；推理（self.training=False）
+            # 时不跳过。keep mask [M,1] 与 [M,C] 广播。
+            p_drop = self.remote_stochastic_depth
+            if self.training and p_drop > 0.0:
+                G, Cc = remote_points.shape[2], remote_points.shape[3]
+                M = B * S
+                flat = remote_points.reshape(M, G, Cc)                     # [M, G, C]
+                agg = self.hyper_agg(flat.unsqueeze(1)).squeeze(1)         # [M, C]
+                residual = flat.mean(dim=1)                                # [M, C]
+                keep = (torch.rand(M, 1, device=flat.device, dtype=flat.dtype) > p_drop)
+                remote_feat = torch.where(keep, agg, residual).reshape(B, S, -1)  # [B, S, C]
+            else:
+                remote_feat = self.hyper_agg(remote_points)                # [B, S, C]
         remote_feat = self.remote_dropout(remote_feat)
         # ---- 门控融合（SECNet 启发，remote_gate=True 时生效）----
         # gate = sigmoid(MLP([remote_feat, centroid_feat]))：由中心点特征决定
