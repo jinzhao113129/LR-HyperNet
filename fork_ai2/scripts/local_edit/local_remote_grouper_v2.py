@@ -171,15 +171,18 @@ def lapsum_soft_topk(scores, k, alpha=0.5):
         x = torch.clamp(x, -30, 30)  # 防 exp 溢出
         return torch.where(x < 0, 0.5 * torch.exp(x), 1 - 0.5 * torch.exp(-x))
 
-    lo = scores.min(dim=-1, keepdim=True).values - 5 * alpha
-    hi = scores.max(dim=-1, keepdim=True).values + 5 * alpha
-    target = n - k  # 第 k 大 = 第 (n-k) 小
-    for _ in range(40):
-        mid = (lo + hi) / 2
-        fsum = laplace_cdf((mid - scores) / alpha).sum(dim=-1, keepdim=True)
-        hi = torch.where(fsum > target, mid, hi)
-        lo = torch.where(fsum <= target, mid, lo)
-    threshold = (lo + hi) / 2
+    with torch.no_grad():
+        # 二分求 threshold 放 no_grad：只保留 p_i 的对角梯度 ∂p_i/∂s_i（Codex P1），
+        # 避免 40 层二分 autograd 图 + τ 随 score 移动的二阶梯度。
+        lo = scores.min(dim=-1, keepdim=True).values - 5 * alpha
+        hi = scores.max(dim=-1, keepdim=True).values + 5 * alpha
+        target = n - k  # 第 k 大 = 第 (n-k) 小
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            fsum = laplace_cdf((mid - scores) / alpha).sum(dim=-1, keepdim=True)
+            hi = torch.where(fsum > target, mid, hi)
+            lo = torch.where(fsum <= target, mid, lo)
+        threshold = (lo + hi) / 2
     return laplace_cdf((scores - threshold) / alpha)
 
 
