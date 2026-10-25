@@ -1610,3 +1610,39 @@ Codex 第二轮复审（接第一轮"暂不可放行 hyp_far"）逐条核验，�
 ### 平台变更
 - 租约 124 到期 → 换 191（gpu-server-3 磁盘在，数据/checkpoint/环境全保留，setup 幂等）。
 - hyp_near/rp1_scorer 均从 checkpoint 续跑或换目录重跑。
+
+## 44. 固定选点扫完 + learned scorer 三轮选择器 + 论文调研（2026-10-24~25）
+
+### G16 固定选点最终对照（小样本快测，统一对比官方 60.6）
+
+| 链 | 语义 | 结果 |
+|---|---|---|
+| rp1_scorer（方向修复后） | 特征最近 + 空间新颖 | 59.64% ✅ 最优 |
+| euc_near | 欧氏特征最近 | 59.10% |
+| euc_far | 欧氏最远 | 44% 塌 |
+| hyp_far / hyp_near | 双曲最远 / 双曲最近 | 46% / 44% 塌 |
+| hclf | 双曲原型分类头 | 53% 负贡献 |
+
+结论：双曲只在聚合层有效（hgate 66.06% 最强），选点层和分类头都负贡献。
+
+### core idea 2（高斯参数化协方差通道）证伪
+- covariance_channel（4DGS 迁移，给事件点加 [σxx,σyy,σxy]）实测 50%，负贡献 8.6pp，撤。
+- 关键区分记录：密度/协方差在"输入层通道"证伪，但在"选点打分信号"位置未测（见 scorer_signal_enhancement）。
+
+### learned scorer（core idea 1）三轮选择器
+- ST_k：ep1=24.7%，稀疏梯度冷启动慢。
+- Gumbel STE（学长推荐）：ep1=30.2%，改善但追不上固定选点。
+- LapSum（论文照搬 2503.06242）：Σp=k 精确 + 稠密梯度 + 确定性，Codex 审过、P1（threshold detach）修好。
+- 归一化 bug 修复：einsum 软加权原没除以 Σw，remote_feat 量级 16× 淹没 local，已修。
+- 结论：三个选择器都试过，冷启动都追不上固定选点——瓶颈不在选择器，在打分信号
+  （RP1 8 特征只用了 2 个）和距离度量（学长 cosine KNN 66.7% vs 我们欧氏 59%）。
+
+### 论文调研（36 篇）
+- 可微选点技术路线完整：CS-Net/LapSum/Statistical Top-k/STE/Gumbel-top-k。
+- 打分信号缺口方案 notes/scorer_signal_enhancement_20261025.md（补事件密度 + XY 距离）。
+- 4DGS 迁移评估：渲染用不上，高斯参数化（协方差）已做成 core idea 2 但证伪。
+
+### 待办
+- cosine_near（代码已写未 push，等学长 RP1 原版代码确认 cosine vs 欧氏）。
+- 打分信号增强（事件密度 + XY 距离，方案已写）。
+- learned 归因消融（Codex P1 混杂：learned 绕过 hyper_agg，需补同池同聚合只变 scorer）。
