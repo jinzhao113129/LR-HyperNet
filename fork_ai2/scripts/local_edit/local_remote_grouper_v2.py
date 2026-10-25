@@ -265,6 +265,8 @@ class RemoteSelector(nn.Module):
         # RP1 空间新颖性选择器（消融实验）
         self.use_rp1_selector = use_rp1_selector
         self.rp1_lambda = rp1_lambda
+        # cosine 相似度选点（cosine_near treatment，学长 Global Feature-KNN 口径）
+        self.use_cosine = False
         # 远程点选择模式：topk / greedy_div / random / spatial_uniform
         assert selector_mode in ("topk", "greedy_div", "random", "spatial_uniform"), \
             f"selector_mode must be one of 'topk'/'greedy_div'/'random'/'spatial_uniform', got {selector_mode}"
@@ -300,6 +302,11 @@ class RemoteSelector(nn.Module):
             elif _t == 'rp1_scorer':
                 self.selector_mode = 'topk'
                 self.use_rp1_selector = True        # 特征距离+λ×空间新颖性
+            elif _t == 'cosine_near':
+                # cosine 相似度选点（学长之前 Global Feature-KNN 口径：特征方向相关，
+                # 非欧氏距离）。cosine 越大=越相似，largest=True 选最高。
+                self.selector_mode = 'topk'
+                self.use_cosine = True
             elif _t == 'learned':
                 # 可学习远程选点（core idea 1）：无偏候选池 + 可学习 scorer + ST_k 软 top-k。
                 # 打分走 candidate−centroid + novelty 标量（Codex P0-2：平移不变 + 保空间信号）。
@@ -313,7 +320,7 @@ class RemoteSelector(nn.Module):
             else:
                 raise ValueError(
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
-                    f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/learned，空串=原行为）")
+                    f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/cosine_near/learned，空串=原行为）")
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
@@ -346,6 +353,12 @@ class RemoteSelector(nn.Module):
         # 3. Gumbel STE（学长推荐）：前向硬 top-k，反向 Gumbel-softmax 稠密梯度
         w = gumbel_ste_topk(scores, G, tau=1.0)  # [B,S,M]，前向 one-hot、反向稠密
         return w, cand_idx
+
+    def _cosine_sim(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+        """cosine 相似度：centroid [B,S,C] × points [B,c,C] → [B,S,c]（越大越相似）。"""
+        c = F.normalize(centroid, dim=-1)          # [B,S,C]
+        p = F.normalize(points, dim=-1)            # [B,c,C]
+        return torch.bmm(c, p.transpose(-1, -2))   # [B,S,c]
 
     def _hyp_dist_chunk(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
         """分块双曲距离计算。
@@ -621,7 +634,9 @@ class RemoteSelector(nn.Module):
                     chunk_rand = self._exclude_local(chunk_rand, local_idx, start)
                     topk_list.append(chunk_rand.topk(k, dim=-1)[1] + start)
                     continue
-                if self.use_hyperbolic:
+                if self.use_cosine:
+                    chunk_dist = self._cosine_sim(centroid_feat, all_feat[:, start:end, :])
+                elif self.use_hyperbolic:
                     chunk_dist = self._hyp_dist_chunk(
                         centroid_feat, all_feat[:, start:end, :])
                 else:
@@ -683,7 +698,12 @@ class RemoteSelector(nn.Module):
                 return _ri.sort(dim=-1)[0]
             # 候选并集上重算距离，取全局 top-G（topk / greedy_div 原有逻辑）
             cand_points = index_points(all_feat, cand_idx)  # [B, S, n_chunks*G, C]
-            if self.use_hyperbolic:
+            if self.use_cosine:
+                # cosine 相似度：cand_points [B,S,M,C] × centroid [B,S,1,C] → [B,S,M]
+                c = F.normalize(centroid_feat, dim=-1).unsqueeze(-2)   # [B,S,1,C]
+                p = F.normalize(cand_points, dim=-1)                  # [B,S,M,C]
+                cand_dist = (c * p).sum(-1)                           # [B,S,M]
+            elif self.use_hyperbolic:
                 # 双曲距离：按 batch*group 展平后批量计算，再恢复形状
                 Bc, Sc, Nc, Cc = cand_points.shape
                 centroid_flat = centroid_feat.reshape(Bc * Sc, 1, Cc)
@@ -1300,7 +1320,10 @@ class LocalRemoteGrouper(nn.Module):
             w, cand_idx = self.remote_selector(centroid_feat, points, idx, anchor,
                                                xytp[:, :, 0:3])
             cand_points = index_points(points, cand_idx)               # [B, S, M, C]
-            remote_feat = torch.einsum('bsm,bsmc->bsc', w, cand_points)  # [B, S, C]
+            # 加权平均（除以 Σw 归一化，量级对齐 hyper_agg 的 LayerNorm 输出；
+            # 否则 one-hot 求和 = 16×特征量级，会淹没拼接里的 local 部分）
+            remote_feat = torch.einsum('bsm,bsmc->bsc', w, cand_points) / \
+                w.sum(dim=-1, keepdim=True).clamp(min=1.0)  # [B, S, C]
         else:
             remote_idx = self.remote_selector(centroid_feat, points, idx, anchor,
                                               xytp[:, :, 0:3])  # [B, S, G]
