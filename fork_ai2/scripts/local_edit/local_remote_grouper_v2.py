@@ -158,6 +158,31 @@ def gumbel_ste_topk(scores, k, tau=1.0):
     return hard - soft.detach() + soft
 
 
+def lapsum_soft_topk(scores, k, alpha=0.5):
+    """LapSum 软 top-k（LapSum 2503.06242）：拉普拉斯 CDF 软选择，Σp=k 精确。
+
+    p_i = F((s_i − threshold)/α)，F 标准拉普拉斯 CDF；threshold 是 F-Sum(x)=n−k 的解
+    （第 k 大元素的平滑近似），二分搜索求逆。Σp=k 精确、全可微、确定性（无噪声）。
+    相比 Gumbel STE（前向 one-hot 近似）和 ST_k（稀疏梯度），LapSum 是最优：精确+稠密+确定。
+    """
+    n = scores.shape[-1]
+
+    def laplace_cdf(x):
+        x = torch.clamp(x, -30, 30)  # 防 exp 溢出
+        return torch.where(x < 0, 0.5 * torch.exp(x), 1 - 0.5 * torch.exp(-x))
+
+    lo = scores.min(dim=-1, keepdim=True).values - 5 * alpha
+    hi = scores.max(dim=-1, keepdim=True).values + 5 * alpha
+    target = n - k  # 第 k 大 = 第 (n-k) 小
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        fsum = laplace_cdf((mid - scores) / alpha).sum(dim=-1, keepdim=True)
+        hi = torch.where(fsum > target, mid, hi)
+        lo = torch.where(fsum <= target, mid, lo)
+    threshold = (lo + hi) / 2
+    return laplace_cdf((scores - threshold) / alpha)
+
+
 class RemoteSelector(nn.Module):
     """远程邻居选择器（第一版：特征距离 top-k，不做 learned scorer）。
 
@@ -350,8 +375,8 @@ class RemoteSelector(nn.Module):
         novelty = self._spatial_novelty(cand_xy, local_xy)  # [B,S,M]
         scorer_in = torch.cat([diff, novelty.unsqueeze(-1)], dim=-1)  # [B,S,M,C+1]
         scores = self.learned_scorer(scorer_in).squeeze(-1)  # [B,S,M]
-        # 3. Gumbel STE（学长推荐）：前向硬 top-k，反向 Gumbel-softmax 稠密梯度
-        w = gumbel_ste_topk(scores, G, tau=1.0)  # [B,S,M]，前向 one-hot、反向稠密
+        # 3. LapSum 软 top-k（Σp=k 精确 + 稠密梯度 + 确定性，优于 Gumbel STE/ST_k）
+        w = lapsum_soft_topk(scores, G, alpha=0.5)  # [B,S,M]，Σw=k 精确
         return w, cand_idx
 
     def _cosine_sim(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
