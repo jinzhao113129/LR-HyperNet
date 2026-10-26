@@ -592,6 +592,10 @@ class RemoteSelector(nn.Module):
         # ==== G16 分派激活（空 treatment 时全部跳过,原行为不动）====
         g16_on = bool(getattr(self, 'g16_treatment', ''))
         # euc_near: 方向翻转一行（原文 KNN 语义,Codex 清单#5）
+        # near_mode 只含 euc_near/hyp_near（距离语义：near=largest=False 选最小）。
+        # 注意：cosine_near 语义也是"near"（选最相似），但 cosine 相似度越大越相似，
+        # 方向是 largest=True，与 euc/hyp 相反——所以 cosine_near 必须保持不在此元组内，
+        # 否则 largest 翻反会静默选"最不相似"（Codex P2：防误加）。
         near_mode = g16_on and self.g16_treatment in ('euc_near', 'hyp_near')
         # Codex 第三轮 P0-2 修复：惰性创建一次、持续复用同一 generator——
         # 不再每次 forward 新建 + manual_seed（那会把随机基线变成逐调用
