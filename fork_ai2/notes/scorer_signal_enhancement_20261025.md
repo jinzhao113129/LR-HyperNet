@@ -61,3 +61,36 @@ RP1 原文的 Oracle headroom 是 68%（比我们的 59.64 高 8 个点），而
 就藏在"选点信号"里——原文 Oracle 是"知道哪些点好"（用了全部 8 特征做 membership）。
 我们补齐信号、逼近 Oracle 的选择质量，是通向 68% 的正路。但单信号增益未验证，
 阶段 1 先证伪"密度+XY 距离"这 2 个最有价值的。
+
+## 8. 三篇新论文的具体启发（2026-10-26 补充，打分器网络结构）
+
+读了 GF-Core / POLED / EventFlash 三篇，补充最关键的一块：**打分器网络本身要改，
+不只是加信号**。
+
+### 8.1 GF-Core（2509.16639）——打分器用 GAT 式注意力，不是薄 MLP
+
+GF-Core 的打分公式（Eq.1）：`αij = Softmax(LeakyReLU(aᵀ·[W·hi ‖ W·hj]))`——
+center-candidate 对先过可学习 W 变换、拼接、再过注意力向量 a，显式建模两者交互。
+
+我们的 scorer 现在是 `Linear(C+1→C) → GELU → Linear(C→1)`，只吃 `[candidate−centroid;
+novelty]`，**没有显式 center-candidate 交互**。改法：
+`score = aᵀ · LeakyReLU(Wc·centroid + Wn·candidate)`（GAT 式），或保留差值 + 注意力并行。
+
+### 8.2 POLED（2506.02547）——事件重要性 = ePDF（可学习概率密度函数）
+
+POLED 把事件重要性建模成 ePDF（event-importance probability density function），
+逐事件估分、按概率采样，且 ePDF **可任意定义、可在线适配场景**。这给"事件密度"信号
+一个系统化框架：不是"数体素里几个点"的标量，而是"这个事件属于重要分布的概率"。
+启发：scorer 输出的就是"事件重要性概率"，密度是这个概率的可学习分量。
+
+### 8.3 EventFlash（2602.03230）——密度作为 soft 调制信号
+
+密度算成 `f(D_j)`（soft 调制）融进注意力，不是直接打分。备选用法：密度信号可以作为
+scorer 输出的调制项，而不是独立输入特征。
+
+### 8.4 综合：scorer 增强 v2 的两处改动
+
+1. **打分器网络**：薄 MLP → GAT 式注意力（显式 center-candidate 交互，GF-Core）。
+2. **打分信号**：加事件密度（POLED ePDF 框架）+ XY 距离，共 C+5 维输入或注意力输入。
+
+优先级：先 cosine_near 找回 7pp（度量根因），再上这个 v2 增强（对标 66.7 去超）。
