@@ -1685,3 +1685,12 @@ Codex 第二轮复审（接第一轮"暂不可放行 hyp_far"）逐条核验，�
   P1 已修：learned_v2 且 center_xyz=None 时直接 raise（不静默退化）。
   P2 已修：GAT 措辞改「泛化双线性」、z-score eps 1e-5→1e-3。
 - 待跑：接在 polar / cosine_near 之后，与 rp1_scorer 59.64% 对照。
+
+### polar 提前停 + cosine_near 接棒（2026-10-27 00:14）
+- polar 跑到 ep15，最近 6 个 test acc：49.68 / 51.39 / 51.61 / 51.29 / 52.25 / 52.03——
+  在 52 附近走平（最后 4 轮 ±0.5 波动，斜率 <0.5pp/epoch）。
+- 同轮次对照：fca ep15 = 58.89，polar 落后 6.6pp。按 chr 慢起步的轨迹外推，
+  polar 最终大概率 57–58 一档（中性偏负）。
+- 决策：提前停（退出码 143），把 GPU 让给 cosine_near——后者是这轮唯一能解释
+  7pp 差距的实验。polar 记「待补跑」，不进最终组件矩阵。
+- 链自动接棒：`起 [g16_cosine]（batch=8 accum=4）flags=--remote_g16 --g16_treatment cosine_near`。
