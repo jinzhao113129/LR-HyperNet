@@ -1646,3 +1646,42 @@ Codex 第二轮复审（接第一轮"暂不可放行 hyp_far"）逐条核验，�
 - cosine_near（代码已写未 push，等学长 RP1 原版代码确认 cosine vs 欧氏）。
 - 打分信号增强（事件密度 + XY 距离，方案已写）。
 - learned 归因消融（Codex P1 混杂：learned 绕过 hyper_agg，需补同池同聚合只变 scorer）。
+
+## 45. 组件链串行续跑：fca 真实峰值 60.493%（纠正 59.85）+ polar 接棒（2026-10-26）
+
+### 背景
+平台拆机器后「租用卡半小时无进程降级 CPU」，用 `scripts/run_remaining_chain.sh`
+串行跑 fca → polar → g16_cosine（cosine_near），一条早停退出立刻接下一條。
+
+### fca 真实结果（重要纠正）
+- 跑中口头报的「峰值 59.85%」是中途读数，**真实 best test acc = 60.493%**
+  （2026-10-26 ep47 刷新，此前 59.85 并非峰值）。
+- 对比：无组件 EMA 基线 58.57% → **+1.92pp**；官方 60.6% → −0.107pp。
+- 定位：fca 是除 hgate（66.06%）外**最好的组件**，且是第一个把「我们自己 baseline
+  与官方的 2pp 差距」基本补齐的组件（此前被定性为「微正 +1.28」，偏低了）。
+- 注意：test acc 波动大（同段 57.92–60.49），60.493 是 best-of-run；与矩阵中其余
+  组件同口径，但若要在论文里作为主结果，建议复跑一次取 EMA-of-last-k 交叉验证。
+
+### 串行链状态
+- fca 于 21:58 手动 SIGTERM（早停计数 5/20，离自然早停还有 ~15 epoch ≈ 2h，
+  结论已定，手动切链）→ 退出码 143 → 写 `~/zhaojin/logs_run/fca.done`。
+- polar 于 21:58 自动接棒，显存 21546 MiB / GPU 76%，ep1 训练中（step 600/899）。
+- 链顺序：fca（完成）→ polar（跑中）→ g16_cosine（cosine_near，最重要，待跑）。
+
+### 复盘
+- 早停计数 5/20 而非 >20，说明 ep47 刷新过 best；此前「ep26 之后一直没超 59.85，
+  早停早该触发」的推断是错的，根因是把中途读数当成了 best。
+
+### learned scorer v2（learned_v2）实现 + Codex 通过（2026-10-26）
+- 只换「打分器 + 打分信号」，候选池/M/RNG/LapSum 与 v1 逐行相同，便于干净归因。
+- 打分器：GAT 的泛化双线性交互 `LeakyReLU(a_c·W_c·c + a_n·W_n·x)`（独立 W_c/W_n，
+  非 GAT 原文共享 W），GF-Core 2509.16639 启发。
+- 信号（4 路）：cosine 相似度（学长 Global Feature-KNN 有效度量）、XY 距离、
+  时间跨度、事件密度（POLED/EventFlash 体素 log1p）。
+- 新增 `--g16_treatment learned_v2`；`center_xyz` 由 grouper 用 `fps_idx` 传入。
+- 本地自测：`Σw−G`=1.4e-6、候选不含 local、五个 v2 参数梯度非零有限、密度方向
+  正确、grouper 端到端 `new_points=(2,8,6,36)` 反传正常。
+- Codex 复审（notes/codex_review_learned_scorer_v3_20261026.md）：**无 P0，放行**。
+  P1 已修：learned_v2 且 center_xyz=None 时直接 raise（不静默退化）。
+  P2 已修：GAT 措辞改「泛化双线性」、z-score eps 1e-5→1e-3。
+- 待跑：接在 polar / cosine_near 之后，与 rp1_scorer 59.64% 对照。
