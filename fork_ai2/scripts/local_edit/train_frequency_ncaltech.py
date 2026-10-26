@@ -85,10 +85,11 @@ def parse_args():
                              '--hyperbolic_selector 互斥。需配合 --g16_treatment 选准则')
     parser.add_argument('--g16_treatment', type=str, default='',
                         choices=['', 'random', 'spatial_fixed', 'euc_far', 'euc_near',
-                                 'hyp_far', 'hyp_near', 'rp1_scorer', 'learned'],
+                                 'hyp_far', 'hyp_near', 'rp1_scorer', 'cosine_near', 'learned'],
                         help='G16 选点准则（需与 --remote_g16 同开）：空串=原 topk'
                              '双曲行为；random/spatial_fixed/euc_far/euc_near/hyp_far/'
-                             'hyp_near/rp1_scorer/learned（learned=可学习 scorer，core idea 1）')
+                             'hyp_near/rp1_scorer/cosine_near/learned'
+                             '（cosine_near=余弦相似度最近，learned=可学习 scorer）')
     parser.add_argument('--covariance_channel', action='store_true', default=False,
                         help='高斯参数化通道（core idea 2）：每点加体素协方差 [σxx,σyy,σxy]'
                              '3 维（2 阶矩，编码局部形状/方向），embed 输入 4→7，不换 backbone')
