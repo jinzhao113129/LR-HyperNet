@@ -345,10 +345,33 @@ class RemoteSelector(nn.Module):
                     nn.Linear(channel + 1, channel),
                     nn.GELU(),
                     nn.Linear(channel, 1))
+            elif _t == 'learned_v2':
+                # 可学习远程选点 v2：打分器与信号都换，候选池/M/RNG/软 top-k 与 v1 全同
+                # （保证 learned vs learned_v2 只差 scorer+signal，可直接归因）。
+                # 1) GAT 式 center-candidate 交互（GF-Core 2509.16639 Eq.1）：
+                #    e = LeakyReLU(a_c·W_c·centroid + a_n·W_n·candidate)。
+                #    注意这是 GAT 的**泛化双线性形式**：原文用共享 W，这里用
+                #    独立的 W_c/W_n（center 与 candidate 语义不同，不共享更贴合）。
+                #    显式建模两点交互，而非只吃位移差值。
+                # 2) 4 路标量信号：cosine 相似度（学长 Global Feature-KNN 有效度量）、
+                #    XY 距离、时间跨度、事件密度（POLED/EventFlash：密集=运动=重要）。
+                # 3) 位移 MLP 支路保留（能表达 cosine 近邻这类度量），两路相加。
+                self.selector_mode = 'topk'
+                self.learned_M = learned_M
+                self.learned_delta = learned_delta
+                self.v2_Wc = nn.Linear(channel, channel, bias=False)
+                self.v2_Wn = nn.Linear(channel, channel, bias=False)
+                self.v2_a_c = nn.Linear(channel, 1, bias=False)
+                self.v2_a_n = nn.Linear(channel, 1, bias=False)
+                self.v2_mlp = nn.Sequential(
+                    nn.Linear(channel + 4, channel),
+                    nn.GELU(),
+                    nn.Linear(channel, 1))
             else:
                 raise ValueError(
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
-                    f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/cosine_near/learned，空串=原行为）")
+                    f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/cosine_near/"
+                    f"learned/learned_v2，空串=原行为）")
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
@@ -380,6 +403,89 @@ class RemoteSelector(nn.Module):
         scores = self.learned_scorer(scorer_in).squeeze(-1)  # [B,S,M]
         # 3. LapSum 软 top-k（Σp=k 精确 + 稠密梯度 + 确定性，优于 Gumbel STE/ST_k）
         w = lapsum_soft_topk(scores, G, alpha=0.5)  # [B,S,M]，Σw=k 精确
+        return w, cand_idx
+
+    @staticmethod
+    def _voxel_density(xyz: torch.Tensor, bins: int = 16) -> torch.Tensor:
+        """逐事件密度 = 体素内事件数的 log1p（POLED/EventFlash 启发）。
+
+        事件密集处对应运动/变化剧烈，更值得作为远程点。坐标量纲不限：
+        每维按 min-max 归一到 [0,1) 再分格，避免 t 与 x,y 尺度不同导致分格失真。
+
+        Args:
+            xyz: [B, N, 3]（t, x, y）
+        Returns:
+            density: [B, N]，log1p(所在体素事件数)，越密集越大
+        """
+        with torch.no_grad():
+            lo = xyz.amin(dim=1, keepdim=True)                       # [B,1,3]
+            hi = xyz.amax(dim=1, keepdim=True)
+            span = (hi - lo).clamp(min=1e-6)
+            q = ((xyz - lo) / span * bins).floor_().clamp_(0, bins - 1).long()  # [B,N,3]
+            key = (q[..., 0] * bins + q[..., 1]) * bins + q[..., 2]  # [B,N]，bins^3 个体素
+            counts = torch.zeros(xyz.shape[0], bins ** 3,
+                                 device=xyz.device, dtype=torch.float32)
+            counts.scatter_add_(1, key, torch.ones_like(key, dtype=torch.float32))
+            return torch.log1p(counts.gather(1, key)).to(xyz.dtype)  # [B,N]
+
+    def _learned_v2_select(self, centroid_feat, all_feat, local_idx, all_xyz,
+                           center_xyz, B, S, C, N, G):
+        """learned scorer v2：GAT 式交互 + 4 路信号（候选池与 v1 全同）。
+
+        返回 (w, cand_idx)，语义同 _learned_select。
+
+        Args:
+            center_xyz: [B, S, 3] 中心点坐标（grouper 层用 fps_idx 取的准确值）。
+                learned_v2 下**必填**：缺失时直接报错，不静默退化为局部邻居均值
+                （Codex P1：静默兜底会让"中心点取错"这类接线错误无声通过）。
+        """
+        if center_xyz is None:
+            raise ValueError(
+                "g16_treatment='learned_v2' 需要 center_xyz（[B,S,3] 中心点坐标）；"
+                "LocalRemoteGrouper 会用 fps_idx 传入，直接调用 selector 时须显式提供")
+        M = self.learned_M
+        K = local_idx.shape[-1]
+        # 1. 候选池：与 v1 完全一致（同一 RNG、同一 M、同样排除 local）
+        with torch.no_grad():
+            cand = torch.randint(0, N, (B, S, M + K), device=all_feat.device,
+                                 generator=self._g16_rng_inst)
+            is_local = (cand.unsqueeze(-1) == local_idx.unsqueeze(-2)).any(-1)
+            cand = cand.masked_fill(is_local, N)
+            cand_idx = cand.sort(dim=-1).values[..., :M]
+
+        cand_feat = index_points(all_feat, cand_idx)                 # [B,S,M,C]
+        cand_xyz = index_points(all_xyz, cand_idx)                   # [B,S,M,3]
+        center_xyz = center_xyz.unsqueeze(-2)                        # [B,S,1,3]
+
+        # 2. 四路信号。距离/密度按各中心点的候选池做 z-score：
+        #    信号只提供"相对排序"，避免 t 未归一化时量级压过其余三路。
+        def _z(x):
+            return (x - x.mean(dim=-1, keepdim=True)) / \
+                (x.std(dim=-1, keepdim=True) + 1e-3)
+
+        cos_sim = (F.normalize(centroid_feat, dim=-1).unsqueeze(-2) *
+                   F.normalize(cand_feat, dim=-1)).sum(-1)           # [B,S,M]
+        d_xy = _z(torch.norm(cand_xyz[..., 1:3] - center_xyz[..., 1:3], dim=-1))
+        d_t = _z((cand_xyz[..., 0] - center_xyz[..., 0]).abs())
+        dens = index_points(self._voxel_density(all_xyz).unsqueeze(-1),
+                            cand_idx).squeeze(-1)                    # [B,S,M]
+        dens = _z(dens)
+
+        # 3. GAT 式交互项：e = LeakyReLU(a_c·W_c·centroid + a_n·W_n·candidate)
+        #    （a^T[Wh_i‖Wh_j] 的等价分解；LeakyReLU 作用在标量上，与 GAT 一致）
+        e = self.v2_a_c(self.v2_Wc(centroid_feat)).unsqueeze(-2) + \
+            self.v2_a_n(self.v2_Wn(cand_feat))                       # [B,S,M,1]
+        att = F.leaky_relu(e, 0.2).squeeze(-1)                       # [B,S,M]
+
+        # 4. 位移 MLP 支路（保留显式差值，能表达 cosine 近邻这类度量）
+        mlp_in = torch.cat([
+            cand_feat - centroid_feat.unsqueeze(-2),
+            cos_sim.unsqueeze(-1), d_xy.unsqueeze(-1),
+            d_t.unsqueeze(-1), dens.unsqueeze(-1)], dim=-1)          # [B,S,M,C+4]
+        scores = att + self.v2_mlp(mlp_in).squeeze(-1)               # [B,S,M]
+
+        # 5. 软 top-k：与 v1 同款 LapSum（Σw=k 精确 + 稠密梯度 + 确定性）
+        w = lapsum_soft_topk(scores, G, alpha=0.5)
         return w, cand_idx
 
     def _cosine_sim(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
@@ -572,7 +678,8 @@ class RemoteSelector(nn.Module):
     def forward(self, centroid_feat: torch.Tensor, all_feat: torch.Tensor,
                 local_idx: torch.Tensor,
                 global_anchor: torch.Tensor | None = None,
-                all_xyz: torch.Tensor | None = None) -> torch.Tensor:
+                all_xyz: torch.Tensor | None = None,
+                center_xyz: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             centroid_feat: [B, S, C] 中心点特征
@@ -580,9 +687,12 @@ class RemoteSelector(nn.Module):
             local_idx: [B, S, K] 局部邻居索引（待排除）
             global_anchor: [B, S, C] 或 None。全局吸收节点特征（PVAG 启发）；
                 非 None 时混合距离 = 到中心点距离 + anchor_lambda * 到锚点距离。
-            all_xyz: [B, N, 3] 或 None。全部点的空间坐标（x, y, t），
+            all_xyz: [B, N, 3] 或 None。全部点的空间坐标（t, x, y），
                 仅 use_rp1_selector=True 时用于计算空间新颖性（RP1），
                 或 selector_mode="spatial_uniform" 时用于 x,y 网格采样。
+            center_xyz: [B, S, 3] 或 None。中心点自身坐标，仅 learned_v2 使用
+                （时间跨度/XY 距离信号）；learned_v2 下必填，缺失直接报错，
+                其余 treatment 忽略此参数。
         Returns:
             remote_idx: [B, S, G] 远程邻居索引（沿 G 维升序）
         """
@@ -640,7 +750,11 @@ class RemoteSelector(nn.Module):
             if global_anchor.dim() == 1:
                 global_anchor = global_anchor.unsqueeze(0).unsqueeze(0).expand(B, S, -1)
         # ==== learned scorer 分支（core idea 1）：无偏池 + scorer + ST_k 软 top-k ====
-        if g16_on and self.g16_treatment == 'learned':
+        if g16_on and self.g16_treatment in ('learned', 'learned_v2'):
+            if self.g16_treatment == 'learned_v2':
+                return self._learned_v2_select(
+                    centroid_feat, all_feat, local_idx, all_xyz,
+                    center_xyz, B, S, C, N, G)
             return self._learned_select(centroid_feat, all_feat, local_idx, all_xyz,
                                         B, S, C, N, G)
         # 选择只产生离散索引，无需梯度；no_grad 避免距离矩阵挂计算图浪费显存
@@ -1345,12 +1459,14 @@ class LocalRemoteGrouper(nn.Module):
             _g16_sink.clear()  # 开头清：兜底 profiling off 时的上次残留
             if hasattr(self.remote_selector, '_g16_sink'):
                 self.remote_selector._g16_sink = _g16_sink
-        _learned = getattr(self.remote_selector, 'g16_treatment', '') == 'learned'
+        _learned = getattr(self.remote_selector, 'g16_treatment', '') in ('learned', 'learned_v2')
         if _learned:
             # learned scorer：软权重 w [B,S,M] + 候选索引 cand_idx [B,S,M] → 软加权聚合
             # （梯度回流 scorer，推理可退化为硬 top-k）
+            # center_xyz 用 fps_idx 取准确中心坐标（learned_v2 的时间跨度/XY 距离信号）
+            center_xyz = index_points(xytp[:, :, 0:3], fps_idx)        # [B, S, 3]
             w, cand_idx = self.remote_selector(centroid_feat, points, idx, anchor,
-                                               xytp[:, :, 0:3])
+                                               xytp[:, :, 0:3], center_xyz=center_xyz)
             cand_points = index_points(points, cand_idx)               # [B, S, M, C]
             # 加权平均（除以 Σw 归一化，量级对齐 hyper_agg 的 LayerNorm 输出；
             # 否则 one-hot 求和 = 16×特征量级，会淹没拼接里的 local 部分）
