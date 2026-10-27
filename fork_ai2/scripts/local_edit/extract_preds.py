@@ -156,6 +156,8 @@ def build_model(saved_args, num_category):
         use_remote_g16=saved_args["remote_g16"],
         g16_treatment=saved_args.get("g16_treatment", ""),
         g16_rng_seed=saved_args.get("g16_rng_seed", saved_args.get("seed", 42)),
+        learned_M=int(saved_args.get("learned_M", 256) or 256),
+        cs_chunk=int(saved_args.get("cs_chunk", 256) or 256),
     ), {k: saved_args[k] for k in FLAG_KEYS}
 
 
