@@ -976,6 +976,7 @@ class FECNet(nn.Module):
                  g16_rng_seed: int = 42,
                  learned_M: int = 256,
                  cs_chunk: int = 256,
+                 cs_tau: float = 0.1,
                  use_rp1_selector: bool = False,
                  use_hyperbolic_selector: bool = False,
                  use_hyperbolic_classifier: bool = False,
@@ -1106,6 +1107,7 @@ class FECNet(nn.Module):
                                                      g16_rng_seed=g16_rng_seed,
                                                      learned_M=learned_M,
                                                      cs_chunk=cs_chunk,
+                                                     cs_tau=cs_tau,
                                                      stage_idx=i)
             elif use_rp1_selector:
                 local_grouper = RP1SpatialUniformGrouper(self.feature_list[i], self.group_number[i], 24, True, "center", use_scale_norm_fps=use_scale_norm_fps)
