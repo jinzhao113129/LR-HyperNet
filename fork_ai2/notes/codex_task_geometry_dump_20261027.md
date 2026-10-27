@@ -1,4 +1,7 @@
-# 给 Codex 的复审：selector geometry dump（找点 + 几何分析第一步）
+# 给 HPC Claude 的复审：selector geometry dump（找点 + 几何分析第一步）
+
+> 复审方式（2026-10-27 起）：在 HPC 上用 Claude 复查，不再用 Codex。
+> HPC 工作目录 `/home/jnguan/JiangYouxin/ZhaoJin`；审前先同步改动文件。
 
 ## 背景
 
