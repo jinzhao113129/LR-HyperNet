@@ -250,6 +250,7 @@ class RemoteSelector(nn.Module):
                  # ==== learned scorer（core idea 1，2026-10-24 Codex 复审）====
                  channel: int = 64,
                  learned_M: int = 256,
+                 cs_chunk: int = 256,
                  learned_delta: float = 1e-3):
         """
         Args:
@@ -404,7 +405,7 @@ class RemoteSelector(nn.Module):
                 self.selector_mode = 'topk'
                 self.learned_M = learned_M
                 self.learned_delta = learned_delta
-                self.cs_chunk = 256          # 每块中心数，控制 [B,s,M,M] 注意力显存
+                self.cs_chunk = max(1, int(cs_chunk))  # 每块中心数，控制 [B,s,M,M] 显存
                 self.cs_tau = 0.5            # OT 熵正则温度
                 self.cs_q = nn.Linear(channel, channel, bias=False)
                 self.cs_k = nn.Linear(channel, channel, bias=False)
@@ -1362,6 +1363,8 @@ class LocalRemoteGrouper(nn.Module):
                  g16_treatment: str = "",
                  g16_rng_seed: int = 42,
                  stage_idx: int = 0,
+                 learned_M: int = 256,
+                 cs_chunk: int = 256,
                  **kwargs):
         """
         Args:
@@ -1448,6 +1451,8 @@ class LocalRemoteGrouper(nn.Module):
                                               rng_seed=g16_rng_seed,
                                               selector_mode=selector_mode,
                                               div_lambda=div_lambda,
+                                              learned_M=learned_M,
+                                              cs_chunk=cs_chunk,
                                               channel=channel)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
