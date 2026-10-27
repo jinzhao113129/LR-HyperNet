@@ -1001,6 +1001,16 @@ class FECNet(nn.Module):
             raise ValueError("rp1_selector 与 hyperbolic_selector 互斥，只能选一个")
         if use_remote_g16 and (use_rp1_selector or use_hyperbolic_selector):
             raise ValueError("remote_g16 与 rp1_selector/hyperbolic_selector 互斥（同层采样，只能选一个）")
+        # Global Feature-KNN 组件（RP1 G00_global，66.70% 那条）：
+        # 邻居 = 全量特征 KNN(k=24)，无时间窗、无 local/remote 拆分。
+        # 实现上等价于基础 LocalGrouper（modules.py 的 square_distance + argsort
+        # 就是全量 KNN），这里显式命名，便于作为组件跑、与其它组件组合复现对照。
+        use_global_knn = (g16_treatment == 'global_knn')
+        if use_global_knn:
+            if use_rp1_selector or use_hyperbolic_selector:
+                raise ValueError(
+                    "g16_treatment='global_knn' 与 rp1_selector/hyperbolic_selector 互斥")
+            use_remote_g16 = False
         # 两个门控都是替换 gated fusion 的备选（同层互斥，类似 rp1/hsel）：
         # 同开时 forward 的 if/elif 会静默走 hyperbolic_gate，必须显式报错
         if use_hyperbolic_gate and use_fca_gate:
@@ -1051,6 +1061,8 @@ class FECNet(nn.Module):
         self.group_number = group_number if group_number is not None else [2048, 1024, 512, 256]
         self.neighbors = [24, 24, 24, 24]
         self.stages = 3
+        # Global Feature-KNN 组件标记（仅记录，前向走基础 LocalGrouper）
+        self.use_global_knn = use_global_knn
         self.local_grouper_list = nn.ModuleList()
         self.fft_temporal_weight_list = nn.ParameterList()
         self.fft_sptaial_weight_list = nn.ParameterList()
