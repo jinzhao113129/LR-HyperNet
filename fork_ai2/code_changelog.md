@@ -1694,3 +1694,43 @@ Codex 第二轮复审（接第一轮"暂不可放行 hyp_far"）逐条核验，�
 - 决策：提前停（退出码 143），把 GPU 让给 cosine_near——后者是这轮唯一能解释
   7pp 差距的实验。polar 记「待补跑」，不进最终组件矩阵。
 - 链自动接棒：`起 [g16_cosine]（batch=8 accum=4）flags=--remote_g16 --g16_treatment cosine_near`。
+
+## 46. cosine_near 收尾 + 选点几何分析 + RP1 度量重核 + csnet 复现（2026-10-27）
+
+### cosine_near（G16，batch 8 / accum 4）
+- 跑到 ep37 手动停：best test acc **60.493%**（约 ep24 达到，之后 12/20 轮无提升）。
+- 对照：euc_near 59.10（+1.39）、rp1_scorer 59.64（+0.85）；仍只在官方 60.6 附近。
+- 结论：余弦度量在我们这套 24+16 结构里有正贡献，但不是数量级差异。
+
+### RP1 度量重核（关键修正）
+- RP1 文档 66.70% 的「Global Feature-KNN」是**现有 SECNet 基线的全量特征 KNN**；
+  代码里 `_global_knn` 用 `square_distance`（平方 L2），Oracle（68.03%）也是平方 L2。
+  cosine 只出现在 block_retrieval 的块排序。
+- 因此此前「7pp = 学长用 cosine、我们用欧氏」的推断证据不足，方向可能反了；
+  66.70 不是 G16 的正确对照（他们的 Local W384 59.30 / Oracle 68.03 才是）。
+
+### 选点几何分析（学长路线第一步：先找点）
+- 脚本 `scripts/local_edit/selector_geometry_dump.py`：dump 每中心 + 特征最近 16 个
+  远程点 + 局部 24 + 随机 16，读 npz 做统计。
+- stage 0（4 通道输入）：有效秩 3–4/64、远程 cos 0.995——**必然结果，不是病态**。
+- stage 1/2（G16 cosine checkpoint）：有效秩 11.1 / 15.2；远程点彼此 cos 0.70 / 0.65，
+  局部 0.79 / 0.77，随机 0.07 / 0.06。
+- 空间新颖性：远程 0.062 / 0.145，随机 0.596 / 1.263；时间跨度两者几乎无差（0.29 vs 0.32）。
+- 结论：**我们选的「远程点」在空间上紧贴局部邻域，不是真远程**；这比度量更能解释
+  59–60 上不去。下一步候选：候选池硬排除空间/时间邻域，或加多样性约束。
+
+### 代码：global_knn 组件 + csnet 复现
+- `g16_treatment='global_knn'`：RP1 G00_global 的组件化（关闭 remote 分支，走全量
+  特征 KNN）；新增 `--base_dim/--fps_groups` 复现 RP1 宽度（16 / 512）。
+- `g16_treatment='csnet'`（CS-Net 2501.10789 per-center 适配）：
+  候选池 → 偏移注意力 `MLP(F−F_sa)+F`（分块）→ 贡献分数 → 熵正则 OT 软 top-k
+  （`eot_soft_topk`，Σw=G）；训练软、推理硬。偏离论文：全局→per-center、
+  FE 用 backbone 特征替代、未复现 EMD 损失。
+- 自审修 2 个 P1：csnet eval 未走硬 top-k；`--base_dim/--fps_groups` 未进
+  `extract_preds.build_model` 与 resume 校验。新增 `--learned_M/--cs_chunk`。
+- 显存：batch 8 无论如何 OOM；最终 csnet 用 batch 4 / M=128 / chunk=64（18.4GB，~46 分钟/轮）。
+
+### 复审方式变更
+- 2026-10-27 起复审人从 Codex 改为 **HPC 上的 Claude**（工作目录
+  `/home/jnguan/JiangYouxin/ZhaoJin`）。当前 headless 鉴权 401（内部路由 token
+  在非交互会话无效），先自审并记录在 `notes/self_review_csnet_20261027.md`。
