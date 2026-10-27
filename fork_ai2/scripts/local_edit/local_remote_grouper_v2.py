@@ -406,7 +406,7 @@ class RemoteSelector(nn.Module):
                 self.learned_M = learned_M
                 self.learned_delta = learned_delta
                 self.cs_chunk = max(1, int(cs_chunk))  # 每块中心数，控制 [B,s,M,M] 显存
-                self.cs_tau = 0.5            # OT 熵正则温度
+                self.cs_tau = 0.1            # OT 熵正则温度（0.5 太软：有效候选 41 vs k=16）
                 self.cs_q = nn.Linear(channel, channel, bias=False)
                 self.cs_k = nn.Linear(channel, channel, bias=False)
                 self.cs_v = nn.Linear(channel, channel, bias=False)
