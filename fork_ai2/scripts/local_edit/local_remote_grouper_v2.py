@@ -592,7 +592,13 @@ class RemoteSelector(nn.Module):
 
         sig = torch.stack([cos_sim, d_xy, d_t, dens], dim=-1)         # [B,S,M,4]
         scores = self.cs_score(torch.cat([f, sig], dim=-1)).squeeze(-1)
-        w = eot_soft_topk(scores, G, tau=self.cs_tau)                 # Σw=G
+        if self.training:
+            # 训练：EOT 软权重（梯度回流 scorer）
+            w = eot_soft_topk(scores, G, tau=self.cs_tau)             # Σw=G
+        else:
+            # 推理：硬 top-G（CS-Net 论文口径：训练软、推理硬）
+            top = scores.topk(G, dim=-1).indices
+            w = torch.zeros_like(scores).scatter_(-1, top, 1.0)
         return w, cand_idx
 
     def _cosine_sim(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
