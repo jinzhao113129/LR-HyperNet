@@ -765,6 +765,7 @@ def main(args):
             for k in ['data_path','num_point','batch_size','epoch','learning_rate',
                       'optimizer','decay_rate','num_category','grad_accum','seed',
                       'time_enc','kda','spike_time_enc','remote_g16','g16_treatment','rp1_selector','hyperbolic_selector',
+                      'base_dim','fps_groups',
                       'hyperbolic_classifier','hyperbolic_fusion','hyperbolic_embedding',
                       'hyperbolic_attention','event_mamba_ssm','group_norm',
                       # 2026-10-14 ai2 补：推理工具 FLAG_KEYS 已含此二键，
