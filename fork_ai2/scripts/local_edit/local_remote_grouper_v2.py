@@ -251,6 +251,7 @@ class RemoteSelector(nn.Module):
                  channel: int = 64,
                  learned_M: int = 256,
                  cs_chunk: int = 256,
+                 cs_tau: float = 0.1,
                  learned_delta: float = 1e-3):
         """
         Args:
@@ -406,7 +407,7 @@ class RemoteSelector(nn.Module):
                 self.learned_M = learned_M
                 self.learned_delta = learned_delta
                 self.cs_chunk = max(1, int(cs_chunk))  # 每块中心数，控制 [B,s,M,M] 显存
-                self.cs_tau = 0.1            # OT 熵正则温度（0.5 太软：有效候选 41 vs k=16）
+                self.cs_tau = float(cs_tau)  # OT 熵正则温度（0.5 太软：有效候选 41 vs k=16；现走命令行 --cs_tau）
                 self.cs_q = nn.Linear(channel, channel, bias=False)
                 self.cs_k = nn.Linear(channel, channel, bias=False)
                 self.cs_v = nn.Linear(channel, channel, bias=False)
@@ -422,6 +423,20 @@ class RemoteSelector(nn.Module):
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
                     f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/cosine_near/"
                     f"learned/learned_v2/csnet，空串=原行为）")
+            # ==== 启动自检（2026-10-27）：打印真正实例化的选择器，防止旧代码静默跑错 ====
+            # 曾出现 gpu 机是旧版（只有 gumbel），--g16_treatment csnet 静默落到旧
+            # Gumbel、tau 不生效的事故。这行打印的是构造后的真实状态，grep 即可定性。
+            if _t == 'csnet':
+                print(f"[G16-SELECTOR] stage={stage_idx} treatment='csnet' "
+                      f"soft_topk=entropy-OT cs_tau={self.cs_tau} "
+                      f"learned_M={self.learned_M} cs_chunk={self.cs_chunk}", flush=True)
+            elif _t in ('learned', 'learned_v2'):
+                print(f"[G16-SELECTOR] stage={stage_idx} treatment='{_t}' "
+                      f"soft_topk=ST_k/sparse learned_M={self.learned_M}", flush=True)
+            else:
+                print(f"[G16-SELECTOR] stage={stage_idx} treatment='{_t}' "
+                      f"selector_mode={self.selector_mode} (hard rule, no learned top-k)",
+                      flush=True)
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
@@ -1365,6 +1380,7 @@ class LocalRemoteGrouper(nn.Module):
                  stage_idx: int = 0,
                  learned_M: int = 256,
                  cs_chunk: int = 256,
+                 cs_tau: float = 0.1,
                  **kwargs):
         """
         Args:
@@ -1453,6 +1469,7 @@ class LocalRemoteGrouper(nn.Module):
                                               div_lambda=div_lambda,
                                               learned_M=learned_M,
                                               cs_chunk=cs_chunk,
+                                              cs_tau=cs_tau,
                                               channel=channel)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
