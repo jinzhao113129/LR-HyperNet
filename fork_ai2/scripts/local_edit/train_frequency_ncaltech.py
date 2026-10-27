@@ -104,6 +104,12 @@ def parse_args():
     parser.add_argument('--fps_groups', type=int, default=0,
                         help='第一 stage FPS 组数（0=默认 2048）。>0 时按 '
                              'group_number=[G,G/2,...] 生成各 stage 组数')
+    parser.add_argument('--learned_M', type=int, default=256,
+                        help='可学习选点（learned/learned_v2/csnet）的候选池大小，'
+                             '默认 256；显存紧张时降到 64/128')
+    parser.add_argument('--cs_chunk', type=int, default=256,
+                        help='csnet 偏移注意力的每块中心数（控制 [B,s,M,M] 显存），'
+                             '默认 256；显存紧张时降到 64')
     parser.add_argument('--covariance_channel', action='store_true', default=False,
                         help='高斯参数化通道（core idea 2）：每点加体素协方差 [σxx,σyy,σxy]'
                              '3 维（2 阶矩，编码局部形状/方向），embed 输入 4→7，不换 backbone')
@@ -638,6 +644,8 @@ def main(args):
                         use_remote_g16=args.remote_g16,
                         g16_treatment=args.g16_treatment,
                         g16_rng_seed=args.seed,
+                        learned_M=args.learned_M,
+                        cs_chunk=args.cs_chunk,
                         use_rp1_selector=args.rp1_selector,
                         use_hyperbolic_selector=args.hyperbolic_selector,
                         use_spike_time_enc=args.spike_time_enc,
@@ -765,7 +773,7 @@ def main(args):
             for k in ['data_path','num_point','batch_size','epoch','learning_rate',
                       'optimizer','decay_rate','num_category','grad_accum','seed',
                       'time_enc','kda','spike_time_enc','remote_g16','g16_treatment','rp1_selector','hyperbolic_selector',
-                      'base_dim','fps_groups',
+                      'base_dim','fps_groups','learned_M','cs_chunk',
                       'hyperbolic_classifier','hyperbolic_fusion','hyperbolic_embedding',
                       'hyperbolic_attention','event_mamba_ssm','group_norm',
                       # 2026-10-14 ai2 补：推理工具 FLAG_KEYS 已含此二键，
