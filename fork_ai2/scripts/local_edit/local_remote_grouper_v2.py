@@ -186,6 +186,34 @@ def lapsum_soft_topk(scores, k, alpha=0.5):
     return laplace_cdf((scores - threshold) / alpha)
 
 
+def eot_soft_topk(scores, k, tau=0.5, iters=20):
+    """熵正则最优传输的软 top-k（SOFT 2002.06504 / CS-Net 2501.10789）。
+
+    把「选 k 个」建成 2 列 OT：列 0 = 选中、列 1 = 未选。
+    行边际 1/M，列边际 [k/M, (M−k)/M]；代价 C=[−s, 0]（列常数不影响传输计划）。
+    对数域 Sinkhorn 求计划 P，返回 w = P[:,0]·M（Σw=k，全可微、确定性）。
+
+    Args:
+        scores: [..., M] 贡献分数
+    Returns:
+        w: [..., M]，Σw = k
+    """
+    M = scores.shape[-1]
+    cost = torch.stack([-scores, torch.zeros_like(scores)], dim=-1)  # [...,M,2]
+    log_mu = scores.new_full(scores.shape, -math.log(M))             # [...,M]
+    log_nu = torch.log(scores.new_tensor([k / M, (M - k) / M]))      # [2]
+    f = torch.zeros_like(scores)                                     # [...,M]
+    g = torch.zeros_like(cost)                                       # [...,M,2]
+    for _ in range(iters):
+        f = tau * (log_mu - torch.logsumexp((g - cost) / tau, dim=-1))
+        # g 的边际只在 2 列上；算完 [...,2] 后补回 [...,1,2] 以便与 cost 广播
+        g = tau * (log_nu - torch.logsumexp(
+            (f.unsqueeze(-1) - cost) / tau, dim=-2)).unsqueeze(-2)
+    # P 的元素是传输质量（≤1），log 域截断防数值溢出
+    log_p = ((f.unsqueeze(-1) + g - cost) / tau).clamp(min=-30.0, max=0.0)
+    return torch.exp(log_p)[..., 0] * M
+
+
 class RemoteSelector(nn.Module):
     """远程邻居选择器（第一版：特征距离 top-k，不做 learned scorer）。
 
@@ -367,14 +395,77 @@ class RemoteSelector(nn.Module):
                     nn.Linear(channel + 4, channel),
                     nn.GELU(),
                     nn.Linear(channel, 1))
+            elif _t == 'csnet':
+                # CS-Net（2501.10789）per-center 适配：
+                #   候选特征 → 偏移注意力（OA: MLP(F−F_sa)+F）→ 贡献分数 → EOT 软 top-k。
+                # 与论文的差异：论文是全局选 K 个；我们是每个中心在其候选池里选 G 个，
+                # 因此 FE/CA 模块换成本地候选集上的 OA（分块控制 M×M 注意力显存），
+                # 打分器吃 [OA 特征; 四路信号]，top-k 用论文的熵正则 OT（非 LapSum）。
+                self.selector_mode = 'topk'
+                self.learned_M = learned_M
+                self.learned_delta = learned_delta
+                self.cs_chunk = 256          # 每块中心数，控制 [B,s,M,M] 注意力显存
+                self.cs_tau = 0.5            # OT 熵正则温度
+                self.cs_q = nn.Linear(channel, channel, bias=False)
+                self.cs_k = nn.Linear(channel, channel, bias=False)
+                self.cs_v = nn.Linear(channel, channel, bias=False)
+                self.cs_mlp = nn.Sequential(
+                    nn.Linear(channel, channel), nn.GELU(),
+                    nn.Linear(channel, channel))
+                self.cs_score = nn.Sequential(
+                    nn.Linear(channel + 4, channel),
+                    nn.GELU(),
+                    nn.Linear(channel, 1))
             else:
                 raise ValueError(
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
                     f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/cosine_near/"
-                    f"learned/learned_v2，空串=原行为）")
+                    f"learned/learned_v2/csnet，空串=原行为）")
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
             self.register_buffer("c", torch.tensor(curvature_init))
+
+    def _sample_candidates(self, local_idx, B, S, N):
+        """无偏候选池：每中心独立采样 M+K 个（排除局部），取前 M 个。
+
+        与 learned/v1 完全一致：有放回采样、同一 RNG、M 由 learned_M 决定。
+        """
+        M = self.learned_M
+        K = local_idx.shape[-1]
+        with torch.no_grad():
+            cand = torch.randint(0, N, (B, S, M + K), device=local_idx.device,
+                                 generator=self._g16_rng_inst)
+            is_local = (cand.unsqueeze(-1) == local_idx.unsqueeze(-2)).any(-1)
+            cand = cand.masked_fill(is_local, N)          # 局部点置越界值排最后
+            cand_idx = cand.sort(dim=-1).values[..., :M]
+            # 极小 N（测试场景）下 K 缓冲可能不够，仍有越界值；钳到 N-1 兜底。
+            # 生产配置 N=10240/K=24/M=256 时被掩码的期望数 <1，不会触发。
+            return cand_idx.clamp(max=N - 1)
+
+    def _candidate_signals(self, centroid_feat, cand_feat, cand_xyz,
+                           center_xyz, all_xyz, cand_idx):
+        """learned_v2/csnet 的四路打分信号。
+
+        返回 (cos_sim, d_xy, d_t, density)，均为 [B,S,M]：
+          - cosine 相似度（有界，不 z-score）；
+          - XY 距离、时间跨度、事件密度：按各中心候选池 z-score，
+            只保留相对排序，避免 t 未归一化时量级压过其余三路。
+        """
+        if center_xyz is None:
+            raise ValueError("learned_v2/csnet 需要 center_xyz（[B,S,3] 中心点坐标）")
+        center_xyz = center_xyz.unsqueeze(-2)                        # [B,S,1,3]
+
+        def _z(x):
+            return (x - x.mean(dim=-1, keepdim=True)) / \
+                (x.std(dim=-1, keepdim=True) + 1e-3)
+
+        cos_sim = (F.normalize(centroid_feat, dim=-1).unsqueeze(-2) *
+                   F.normalize(cand_feat, dim=-1)).sum(-1)           # [B,S,M]
+        d_xy = _z(torch.norm(cand_xyz[..., 1:3] - center_xyz[..., 1:3], dim=-1))
+        d_t = _z((cand_xyz[..., 0] - center_xyz[..., 0]).abs())
+        dens = index_points(self._voxel_density(all_xyz).unsqueeze(-1),
+                            cand_idx).squeeze(-1)                    # [B,S,M]
+        return cos_sim, d_xy, d_t, _z(dens)
 
     def _learned_select(self, centroid_feat, all_feat, local_idx, all_xyz, B, S, C, N, G):
         """learned scorer：无偏候选池 + 可学习 scorer + ST_k 软 top-k（core idea 1）。
@@ -387,12 +478,8 @@ class RemoteSelector(nn.Module):
         M = self.learned_M
         K = local_idx.shape[-1]
         _g16_rng = self._g16_rng_inst
-        # 1. 无偏采样候选（no_grad：离散采样不产生梯度），多采 K 缓冲排除 local
-        with torch.no_grad():
-            cand = torch.randint(0, N, (B, S, M + K), device=all_feat.device, generator=_g16_rng)
-            is_local = (cand.unsqueeze(-1) == local_idx.unsqueeze(-2)).any(-1)  # [B,S,M+K]
-            cand = cand.masked_fill(is_local, N)  # local 标 N（越界值，排最后）
-            cand_idx = cand.sort(dim=-1).values[..., :M]  # 取前 M 个非 local
+        # 1. 无偏候选池（与 v2/csnet 共用同一实现：有放回采样 + 排除 local）
+        cand_idx = self._sample_candidates(local_idx, B, S, N)
         # 2. scorer 打分（可微，在 no_grad 外）
         cand_feat = index_points(all_feat, cand_idx)  # [B, S, M, C]
         diff = cand_feat - centroid_feat.unsqueeze(-2)  # candidate−centroid [B,S,M,C]
@@ -446,30 +533,12 @@ class RemoteSelector(nn.Module):
         M = self.learned_M
         K = local_idx.shape[-1]
         # 1. 候选池：与 v1 完全一致（同一 RNG、同一 M、同样排除 local）
-        with torch.no_grad():
-            cand = torch.randint(0, N, (B, S, M + K), device=all_feat.device,
-                                 generator=self._g16_rng_inst)
-            is_local = (cand.unsqueeze(-1) == local_idx.unsqueeze(-2)).any(-1)
-            cand = cand.masked_fill(is_local, N)
-            cand_idx = cand.sort(dim=-1).values[..., :M]
+        cand_idx = self._sample_candidates(local_idx, B, S, N)
 
         cand_feat = index_points(all_feat, cand_idx)                 # [B,S,M,C]
         cand_xyz = index_points(all_xyz, cand_idx)                   # [B,S,M,3]
-        center_xyz = center_xyz.unsqueeze(-2)                        # [B,S,1,3]
-
-        # 2. 四路信号。距离/密度按各中心点的候选池做 z-score：
-        #    信号只提供"相对排序"，避免 t 未归一化时量级压过其余三路。
-        def _z(x):
-            return (x - x.mean(dim=-1, keepdim=True)) / \
-                (x.std(dim=-1, keepdim=True) + 1e-3)
-
-        cos_sim = (F.normalize(centroid_feat, dim=-1).unsqueeze(-2) *
-                   F.normalize(cand_feat, dim=-1)).sum(-1)           # [B,S,M]
-        d_xy = _z(torch.norm(cand_xyz[..., 1:3] - center_xyz[..., 1:3], dim=-1))
-        d_t = _z((cand_xyz[..., 0] - center_xyz[..., 0]).abs())
-        dens = index_points(self._voxel_density(all_xyz).unsqueeze(-1),
-                            cand_idx).squeeze(-1)                    # [B,S,M]
-        dens = _z(dens)
+        cos_sim, d_xy, d_t, dens = self._candidate_signals(
+            centroid_feat, cand_feat, cand_xyz, center_xyz, all_xyz, cand_idx)
 
         # 3. GAT 式交互项：e = LeakyReLU(a_c·W_c·centroid + a_n·W_n·candidate)
         #    （a^T[Wh_i‖Wh_j] 的等价分解；LeakyReLU 作用在标量上，与 GAT 一致）
@@ -486,6 +555,44 @@ class RemoteSelector(nn.Module):
 
         # 5. 软 top-k：与 v1 同款 LapSum（Σw=k 精确 + 稠密梯度 + 确定性）
         w = lapsum_soft_topk(scores, G, alpha=0.5)
+        return w, cand_idx
+
+    def _csnet_select(self, centroid_feat, all_feat, local_idx, all_xyz,
+                      center_xyz, B, S, C, N, G):
+        """CS-Net（2501.10789）的 per-center 适配：OA + 贡献分数 + EOT 软 top-k。
+
+        与论文的对应关系：
+          - FE/CA → 候选集上的偏移注意力 OA(F)=MLP(F−F_sa)+F（F 为候选相对中心特征）；
+          - CS  → 贡献分数 MLP（吃 OA 特征 + 四路信号）；
+          - Top-k → 熵正则最优传输（eot_soft_topk），不是 LapSum；
+          - 训练软加权、推理硬 top-k（由 grouper 的 learned 分支统一处理）。
+        与论文的差异：论文全局选 K 个，这里每中心在候选池里选 G 个；
+        注意力按中心分块（cs_chunk），避免 [B,S,M,M] 显存爆掉。
+        """
+        if center_xyz is None:
+            raise ValueError("g16_treatment='csnet' 需要 center_xyz（[B,S,3]）")
+        cand_idx = self._sample_candidates(local_idx, B, S, N)
+        cand_feat = index_points(all_feat, cand_idx)                  # [B,S,M,C]
+        cand_xyz = index_points(all_xyz, cand_idx)                    # [B,S,M,3]
+        cos_sim, d_xy, d_t, dens = self._candidate_signals(
+            centroid_feat, cand_feat, cand_xyz, center_xyz, all_xyz, cand_idx)
+
+        f = cand_feat - centroid_feat.unsqueeze(-2)                   # [B,S,M,C]
+        scale = C ** -0.5
+        outs = []
+        for s0 in range(0, S, self.cs_chunk):
+            fc = f[:, s0:s0 + self.cs_chunk]                          # [B,s,M,C]
+            q = self.cs_q(fc)
+            k = self.cs_k(fc)
+            v = self.cs_v(fc)
+            att = torch.softmax(q @ k.transpose(-1, -2) * scale, dim=-1)
+            sa = att @ v
+            outs.append(self.cs_mlp(fc - sa) + fc)                    # OA 残差
+        f = torch.cat(outs, dim=1)                                    # [B,S,M,C]
+
+        sig = torch.stack([cos_sim, d_xy, d_t, dens], dim=-1)         # [B,S,M,4]
+        scores = self.cs_score(torch.cat([f, sig], dim=-1)).squeeze(-1)
+        w = eot_soft_topk(scores, G, tau=self.cs_tau)                 # Σw=G
         return w, cand_idx
 
     def _cosine_sim(self, centroid: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
@@ -750,7 +857,11 @@ class RemoteSelector(nn.Module):
             if global_anchor.dim() == 1:
                 global_anchor = global_anchor.unsqueeze(0).unsqueeze(0).expand(B, S, -1)
         # ==== learned scorer 分支（core idea 1）：无偏池 + scorer + ST_k 软 top-k ====
-        if g16_on and self.g16_treatment in ('learned', 'learned_v2'):
+        if g16_on and self.g16_treatment in ('learned', 'learned_v2', 'csnet'):
+            if self.g16_treatment == 'csnet':
+                return self._csnet_select(
+                    centroid_feat, all_feat, local_idx, all_xyz,
+                    center_xyz, B, S, C, N, G)
             if self.g16_treatment == 'learned_v2':
                 return self._learned_v2_select(
                     centroid_feat, all_feat, local_idx, all_xyz,
@@ -1459,7 +1570,8 @@ class LocalRemoteGrouper(nn.Module):
             _g16_sink.clear()  # 开头清：兜底 profiling off 时的上次残留
             if hasattr(self.remote_selector, '_g16_sink'):
                 self.remote_selector._g16_sink = _g16_sink
-        _learned = getattr(self.remote_selector, 'g16_treatment', '') in ('learned', 'learned_v2')
+        _learned = getattr(self.remote_selector, 'g16_treatment', '') in (
+            'learned', 'learned_v2', 'csnet')
         if _learned:
             # learned scorer：软权重 w [B,S,M] + 候选索引 cand_idx [B,S,M] → 软加权聚合
             # （梯度回流 scorer，推理可退化为硬 top-k）
