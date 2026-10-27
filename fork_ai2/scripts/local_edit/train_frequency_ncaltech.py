@@ -86,12 +86,24 @@ def parse_args():
     parser.add_argument('--g16_treatment', type=str, default='',
                         choices=['', 'random', 'spatial_fixed', 'euc_far', 'euc_near',
                                  'hyp_far', 'hyp_near', 'rp1_scorer', 'cosine_near',
-                                 'learned', 'learned_v2'],
+                                 'learned', 'learned_v2', 'global_knn', 'csnet'],
                         help='G16 选点准则（需与 --remote_g16 同开）：空串=原 topk'
                              '双曲行为；random/spatial_fixed/euc_far/euc_near/hyp_far/'
-                             'hyp_near/rp1_scorer/cosine_near/learned/learned_v2'
+                             'hyp_near/rp1_scorer/cosine_near/learned/learned_v2/'
+                             'global_knn/csnet'
                              '（cosine_near=余弦相似度最近，learned=可学习 scorer v1，'
-                             'learned_v2=GAT 式交互 scorer + 4 路信号）')
+                             'learned_v2=GAT 式交互 scorer + 4 路信号，'
+                             'global_knn=RP1 G00_global 全量特征 KNN 组件，'
+                             'csnet=CS-Net 偏移注意力 + EOT 软 top-k）')
+    # RP1 复现口径（2026-10-27）：base_dim=16 / fps_groups=512 对应 RP1 G00_global
+    # 的模型宽度（feature_list=[16,36,76,156]、group_number=[512,256,128,64]）。
+    # 0 = 保持官方 N-Caltech101 默认（64 / 2048），不改变旧实验行为。
+    parser.add_argument('--base_dim', type=int, default=0,
+                        help='第一 stage 特征宽度（0=默认 64）。>0 时按 '
+                             'feature_list=[d,2d+4,...] 生成各 stage 宽度')
+    parser.add_argument('--fps_groups', type=int, default=0,
+                        help='第一 stage FPS 组数（0=默认 2048）。>0 时按 '
+                             'group_number=[G,G/2,...] 生成各 stage 组数')
     parser.add_argument('--covariance_channel', action='store_true', default=False,
                         help='高斯参数化通道（core idea 2）：每点加体素协方差 [σxx,σyy,σxy]'
                              '3 维（2 阶矩，编码局部形状/方向），embed 输入 4→7，不换 backbone')
@@ -601,8 +613,25 @@ def main(args):
     best_train_loss = float("inf")
 
 
+    # RP1 G00_global 复现口径：按 base_dim / fps_groups 生成各 stage 宽度与组数
+    # （公式与 RP1 FECNet 一致：feature_list=[d, 2d+4, ...]、group_number=[G, G/2, ...]）。
+    # 两者都为 0 时传 None，FECNet 用官方默认 [64,132,268,540] / [2048,1024,512,256]。
+    if args.base_dim > 0 or args.fps_groups > 0:
+        _d = args.base_dim if args.base_dim > 0 else 64
+        _g = args.fps_groups if args.fps_groups > 0 else 2048
+        _fl = [_d]
+        for _ in range(3):                     # FECNet.stages = 3 → 4 个 stage 宽度
+            _fl.append(_fl[-1] * 2 + 4)
+        _gn = [max(1, _g // (2 ** i)) for i in range(4)]
+        log_string(f"RP1 dims: base_dim={_d} fps_groups={_g} "
+                   f"feature_list={_fl} group_number={_gn}")
+    else:
+        _fl, _gn = None, None
+
     from models.FECNet import FECNet
     classifier = FECNet(num_classes=args.num_category,
+                        feature_list=_fl,
+                        group_number=_gn,
                         use_group_norm=args.group_norm,
                         use_time_enc=args.time_enc,
                         use_kda=args.kda,
