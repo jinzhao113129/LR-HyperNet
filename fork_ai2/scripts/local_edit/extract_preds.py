@@ -118,8 +118,23 @@ def build_model(saved_args, num_category):
     missing = [k for k in FLAG_KEYS if k not in saved_args]
     if missing:
         raise ValueError("flags missing keys: %s" % missing)
+    # 2026-10-27：RP1 复现口径的模型宽度（base_dim/fps_groups）。窄模型 checkpoint
+    # 必须按同样宽度重建，否则 strict load 失败；缺键视为 0（官方默认宽度）。
+    _bd = int(saved_args.get("base_dim", 0) or 0)
+    _fg = int(saved_args.get("fps_groups", 0) or 0)
+    if _bd > 0 or _fg > 0:
+        _d = _bd if _bd > 0 else 64
+        _g = _fg if _fg > 0 else 2048
+        feature_list = [_d]
+        for _ in range(3):                      # FECNet.stages = 3
+            feature_list.append(feature_list[-1] * 2 + 4)
+        group_number = [max(1, _g // (2 ** i)) for i in range(4)]
+    else:
+        feature_list, group_number = None, None
     return FECNet(
         num_classes=num_category,
+        feature_list=feature_list,
+        group_number=group_number,
         use_group_norm=saved_args["group_norm"],
         use_time_enc=saved_args["time_enc"],
         use_kda=saved_args["kda"],
