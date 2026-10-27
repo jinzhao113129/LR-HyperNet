@@ -21,11 +21,13 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 
-sys.path[:0] = [".", "tools", "models"]
+ROOT = Path(__file__).resolve().parent.parent
+sys.path[:0] = [str(ROOT), str(ROOT / "tools"), str(ROOT / "models")]
 import extract_preds  # noqa: E402  复用 checkpoint 解析 + 模型构建
 from modules import furthest_point_sample, index_points, square_distance  # noqa: E402
 

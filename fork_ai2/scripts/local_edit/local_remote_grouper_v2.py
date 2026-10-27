@@ -252,6 +252,7 @@ class RemoteSelector(nn.Module):
                  learned_M: int = 256,
                  cs_chunk: int = 256,
                  cs_tau: float = 0.1,
+                 selector_novelty_weight: float = 1.0,
                  learned_delta: float = 1e-3):
         """
         Args:
@@ -334,6 +335,9 @@ class RemoteSelector(nn.Module):
         # 六处理显式名（Codex 清单#1）: random / spatial_fixed / euc_far /
         # euc_near / hyp_far / hyp_near / rp1_scorer。非空时激活分派+缓存生产。
         self.g16_treatment = g16_treatment
+        self.selector_novelty_weight = float(selector_novelty_weight)
+        if self.selector_novelty_weight < 0:
+            raise ValueError("selector_novelty_weight 必须 >= 0")
         self.stage_idx = stage_idx
         # RNG 隔离（Codex 清单#4）: 每实例独立 Generator，
         # seed = rng_seed*1000 + stage_idx（写进 checkpoint 的 args 恢复）
@@ -363,6 +367,11 @@ class RemoteSelector(nn.Module):
             elif _t == 'cosine_near':
                 # cosine 相似度选点（学长之前 Global Feature-KNN 口径：特征方向相关，
                 # 非欧氏距离）。cosine 越大=越相似，largest=True 选最高。
+                self.selector_mode = 'topk'
+                self.use_cosine = True
+            elif _t in ('cosine_diverse', 'cosine_mix'):
+                # 假设（待贡献归因验证）：高相关点中保留一定空间覆盖可能更好。
+                # 与 csnet/learned 的软选择无关，索引仍为固定硬选。
                 self.selector_mode = 'topk'
                 self.use_cosine = True
             elif _t == 'learned':
@@ -422,7 +431,7 @@ class RemoteSelector(nn.Module):
                 raise ValueError(
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
                     f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/cosine_near/"
-                    f"learned/learned_v2/csnet，空串=原行为）")
+                    f"cosine_diverse/cosine_mix/learned/learned_v2/csnet，空串=原行为）")
             # ==== 启动自检（2026-10-27）：打印真正实例化的选择器，防止旧代码静默跑错 ====
             # 曾出现 gpu 机是旧版（只有 gumbel），--g16_treatment csnet 静默落到旧
             # Gumbel、tau 不生效的事故。这行打印的是构造后的真实状态，grep 即可定性。
@@ -435,7 +444,9 @@ class RemoteSelector(nn.Module):
                       f"soft_topk=ST_k/sparse learned_M={self.learned_M}", flush=True)
             else:
                 print(f"[G16-SELECTOR] stage={stage_idx} treatment='{_t}' "
-                      f"selector_mode={self.selector_mode} (hard rule, no learned top-k)",
+                      f"selector_mode={self.selector_mode} "
+                      f"novelty_weight={self.selector_novelty_weight} "
+                      f"(hard rule, no learned top-k)",
                       flush=True)
         if use_hyperbolic:
             # 曲率作为 buffer（选点只需固定几何空间，不参与优化）
@@ -804,6 +815,69 @@ class RemoteSelector(nn.Module):
         final = priority.topk(G, dim=-1)[1]              # [B, S, G]
         return torch.gather(cand_idx, -1, final)
 
+    def _geometry_pool(self, center_feat, all_feat, local_idx,
+                       all_xyz, center_xyz):
+        """从全点中收集余弦近邻与 XY 远点，局部邻居先排除。"""
+        B, S, C = center_feat.shape
+        N = all_feat.shape[1]
+        count = min(max(64, self.remote_g * 4), N - local_idx.shape[-1])
+        c = F.normalize(center_feat, dim=-1)
+        p = F.normalize(all_feat, dim=-1)
+        sim = torch.bmm(c, p.transpose(1, 2))
+        sim.scatter_(-1, local_idx, float('-inf'))
+        xy = all_xyz[:, None, :, 1:3] - center_xyz[:, :, None, 1:3]
+        dist = xy.square().sum(-1)
+        dist.scatter_(-1, local_idx, float('-inf'))
+        near = sim.topk(count, dim=-1).indices
+        far = dist.topk(count, dim=-1).indices
+        pool = torch.cat([near, far], dim=-1)
+        pool_sim = torch.gather(sim, -1, pool)
+        pool_xy = index_points(all_xyz[:, :, 1:3], pool)
+        return pool, pool_sim, pool_xy
+
+    def _geometry_greedy(self, pool, sim, xy, local_xy):
+        """选 16 个不重复索引；mix 前半重相似，后半重局部新颖。"""
+        B, S, M = pool.shape
+        chosen = []
+        chosen_idx = []
+        used = torch.zeros((B, S, M), dtype=torch.bool, device=pool.device)
+        novelty = self._spatial_novelty(xy, local_xy)
+        weight = self.selector_novelty_weight
+        for step in range(self.remote_g):
+            if self.g16_treatment == 'cosine_mix':
+                score = sim if step < self.remote_g // 2 else sim + weight * novelty
+            elif step == 0:
+                score = sim
+            else:
+                previous = torch.cat(chosen, dim=-2)
+                coverage = torch.cdist(xy.reshape(B * S, M, 2),
+                                       previous.reshape(B * S, step, 2))
+                coverage = coverage.min(-1).values.reshape(B, S, M)
+                score = sim + weight * coverage
+            masked = score.masked_fill(used, float('-inf'))
+            at = masked.argmax(-1, keepdim=True)
+            selected_idx = torch.gather(pool, -1, at)
+            chosen.append(torch.gather(xy, -2, at.unsqueeze(-1).expand(-1, -1, -1, 2)))
+            chosen_idx.append(selected_idx)
+            used |= pool == selected_idx
+        return torch.cat(chosen_idx, dim=-1).sort(dim=-1).values
+
+    def _geometry_select(self, centroid_feat, all_feat, local_idx,
+                         all_xyz, center_xyz):
+        """按中心分块执行两种空间覆盖假设，避免完整 B×S×N 常驻。"""
+        if center_xyz is None:
+            raise ValueError("cosine_diverse/cosine_mix 需要 center_xyz")
+        outputs = []
+        local_xy = index_points(all_xyz[:, :, 1:3], local_idx)
+        for start in range(0, centroid_feat.shape[1], 64):
+            end = start + 64
+            pool, sim, xy = self._geometry_pool(
+                centroid_feat[:, start:end], all_feat,
+                local_idx[:, start:end], all_xyz, center_xyz[:, start:end])
+            outputs.append(self._geometry_greedy(
+                pool, sim, xy, local_xy[:, start:end]))
+        return torch.cat(outputs, dim=1)
+
     def forward(self, centroid_feat: torch.Tensor, all_feat: torch.Tensor,
                 local_idx: torch.Tensor,
                 global_anchor: torch.Tensor | None = None,
@@ -890,6 +964,12 @@ class RemoteSelector(nn.Module):
                     center_xyz, B, S, C, N, G)
             return self._learned_select(centroid_feat, all_feat, local_idx, all_xyz,
                                         B, S, C, N, G)
+        if g16_on and self.g16_treatment in ('cosine_diverse', 'cosine_mix'):
+            with torch.no_grad():
+                remote_idx = self._geometry_select(
+                    centroid_feat, all_feat, local_idx, all_xyz, center_xyz)
+            self._g16_cache(remote_idx, local_idx, all_xyz, all_feat)
+            return remote_idx
         # 选择只产生离散索引，无需梯度；no_grad 避免距离矩阵挂计算图浪费显存
         with torch.no_grad():
             topk_list = []
@@ -1381,6 +1461,7 @@ class LocalRemoteGrouper(nn.Module):
                  learned_M: int = 256,
                  cs_chunk: int = 256,
                  cs_tau: float = 0.1,
+                 selector_novelty_weight: float = 1.0,
                  **kwargs):
         """
         Args:
@@ -1470,6 +1551,7 @@ class LocalRemoteGrouper(nn.Module):
                                               learned_M=learned_M,
                                               cs_chunk=cs_chunk,
                                               cs_tau=cs_tau,
+                                              selector_novelty_weight=selector_novelty_weight,
                                               channel=channel)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
@@ -1614,7 +1696,9 @@ class LocalRemoteGrouper(nn.Module):
                 w.sum(dim=-1, keepdim=True).clamp(min=1.0)  # [B, S, C]
         else:
             remote_idx = self.remote_selector(centroid_feat, points, idx, anchor,
-                                              xytp[:, :, 0:3])  # [B, S, G]
+                                              xytp[:, :, 0:3],
+                                              center_xyz=index_points(
+                                                  xytp[:, :, 0:3], fps_idx))  # [B,S,G]
             # selector 缓存的记录里补填 centroid（fps_idx 只在 grouper 层可见）
             if _g16_sink is not None and len(_g16_sink) > 0:
                 rec = _g16_sink[-1]

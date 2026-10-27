@@ -159,6 +159,7 @@ def build_model(saved_args, num_category):
         learned_M=int(saved_args.get("learned_M", 256) or 256),
         cs_chunk=int(saved_args.get("cs_chunk", 256) or 256),
         cs_tau=float(saved_args.get("cs_tau", 0.1) or 0.1),
+        selector_novelty_weight=float(saved_args.get("selector_novelty_weight", 1.0)),
     ), {k: saved_args[k] for k in FLAG_KEYS}
 
 
