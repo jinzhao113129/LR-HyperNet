@@ -110,6 +110,10 @@ def parse_args():
     parser.add_argument('--cs_chunk', type=int, default=256,
                         help='csnet 偏移注意力的每块中心数（控制 [B,s,M,M] 显存），'
                              '默认 256；显存紧张时降到 64')
+    parser.add_argument('--cs_tau', type=float, default=0.1,
+                        help='csnet 熵正则 OT 软 top-k 的温度（仅 csnet 生效）。'
+                             '默认 0.1；0.5 太软（有效候选 41 vs k=16）。'
+                             '会写入保存的 args，启动时打印实际值')
     parser.add_argument('--covariance_channel', action='store_true', default=False,
                         help='高斯参数化通道（core idea 2）：每点加体素协方差 [σxx,σyy,σxy]'
                              '3 维（2 阶矩，编码局部形状/方向），embed 输入 4→7，不换 backbone')
@@ -646,6 +650,7 @@ def main(args):
                         g16_rng_seed=args.seed,
                         learned_M=args.learned_M,
                         cs_chunk=args.cs_chunk,
+                        cs_tau=args.cs_tau,
                         use_rp1_selector=args.rp1_selector,
                         use_hyperbolic_selector=args.hyperbolic_selector,
                         use_spike_time_enc=args.spike_time_enc,
@@ -773,7 +778,7 @@ def main(args):
             for k in ['data_path','num_point','batch_size','epoch','learning_rate',
                       'optimizer','decay_rate','num_category','grad_accum','seed',
                       'time_enc','kda','spike_time_enc','remote_g16','g16_treatment','rp1_selector','hyperbolic_selector',
-                      'base_dim','fps_groups','learned_M','cs_chunk',
+                      'base_dim','fps_groups','learned_M','cs_chunk','cs_tau',
                       'hyperbolic_classifier','hyperbolic_fusion','hyperbolic_embedding',
                       'hyperbolic_attention','event_mamba_ssm','group_norm',
                       # 2026-10-14 ai2 补：推理工具 FLAG_KEYS 已含此二键，
