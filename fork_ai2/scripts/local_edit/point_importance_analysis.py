@@ -383,12 +383,12 @@ def replay_records(args, files: dict, pairs: list[dict], split: str):
                 raise ValueError("样本映射超出数据范围")
             capture = capture_sample(model, selector, intervention,
                 all_data[source_id], args.seed + sample, device, args.stage)
-                for center in sorted({p["center"] for p in sample_pairs}):
-                    difference = verify_artifact(files[sample, center], capture)
-                    checks.append({"sample": sample, "source_sample_id": source_id,
-                                   "center": center, "max_abs_difference": difference})
-                records.extend(enrich_pairs(sample_pairs, capture))
-                print(f"已核验样本 {sample} → {split}[{source_id}]", flush=True)
+            for center in sorted({p["center"] for p in sample_pairs}):
+                difference = verify_artifact(files[sample, center], capture)
+                checks.append({"sample": sample, "source_sample_id": source_id,
+                               "center": center, "max_abs_difference": difference})
+            records.extend(enrich_pairs(sample_pairs, capture))
+            print(f"已核验样本 {sample} → {split}[{source_id}]", flush=True)
     finally:
         handle.remove()
         selector.remove()
