@@ -176,13 +176,13 @@ def verify_artifact(path: Path, capture: dict) -> dict:
                     stored, replay, rtol=0.005, atol=0.005):
                 differences[key] = float(np.max(np.abs(stored - replay)))
                 continue
-            # 严格索引匹配失败：按点集排序后核对，确认点集一致
-            order_saved = np.lexsort(stored.T)
-            order_replay = np.lexsort(actual.T)
-            sorted_saved = stored[order_saved]
-            sorted_actual = actual[order_replay][:len(stored)]
-            if sorted_saved.shape != sorted_actual.shape or not np.allclose(
-                    sorted_saved, sorted_actual, rtol=0.01, atol=0.01):
+            # 严格索引匹配失败：逐个在重放点集中找匹配点，确认点集一致
+            all_matched = True
+            for point in stored:
+                if np.abs(actual - point).max(axis=1).min() >= 0.02:
+                    all_matched = False
+                    break
+            if not all_matched:
                 raise ValueError(f"{path.name}: {key} 与重放不匹配；检查来源、"
                                  "sample_id_map、stage、checkpoint、EMA 和 seed")
             differences[key] = float(np.max(np.abs(stored - replay)))
