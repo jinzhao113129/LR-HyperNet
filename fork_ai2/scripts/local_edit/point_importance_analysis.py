@@ -379,6 +379,8 @@ def replay_records(args, files: dict, pairs: list[dict], split: str):
         args.sample_ids = None
     if not hasattr(args, "max_samples"):
         args.max_samples = 100000
+    if not hasattr(args, "num_point"):
+        args.num_point = 10240
     all_data, _ = train_examples(args)
     try:
         for sample, sample_pairs in sorted(by_sample.items()):
