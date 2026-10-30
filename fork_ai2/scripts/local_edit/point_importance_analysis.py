@@ -375,6 +375,10 @@ def replay_records(args, files: dict, pairs: list[dict], split: str):
         by_sample[pair["sample"]].append(pair)
     records, checks = [], []
     from selector_utility_probe import train_examples
+    if not hasattr(args, "sample_ids"):
+        args.sample_ids = None
+    if not hasattr(args, "max_samples"):
+        args.max_samples = 100000
     all_data, _ = train_examples(args)
     try:
         for sample, sample_pairs in sorted(by_sample.items()):
