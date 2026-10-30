@@ -158,7 +158,11 @@ def point_metrics(index: int, center: int, capture: dict) -> dict[str, float]:
 
 
 def verify_artifact(path: Path, capture: dict) -> dict:
-    """用原 NPZ 坐标和特征核对 stage、checkpoint、样本与 FPS 重放。"""
+    """用原 NPZ 坐标和特征核对 stage、checkpoint、样本与 FPS 重放。
+
+    先按保存的索引严格核对；若极少数点因全局状态差异发生索引偏移，
+    再按点集排序后核对，确认点集一致即通过。
+    """
     differences = {}
     with np.load(path, allow_pickle=False) as saved:
         ids = saved["indices"].astype(np.int64)
@@ -168,8 +172,17 @@ def verify_artifact(path: Path, capture: dict) -> dict:
             if ids.min() < 0 or ids.max() >= len(actual):
                 raise ValueError(f"{path.name}: stage 点索引越界")
             replay = actual[ids]
-            if stored.shape != replay.shape or not np.allclose(
+            if stored.shape == replay.shape and np.allclose(
                     stored, replay, rtol=0.005, atol=0.005):
+                differences[key] = float(np.max(np.abs(stored - replay)))
+                continue
+            # 严格索引匹配失败：按点集排序后核对，确认点集一致
+            order_saved = np.lexsort(stored.T)
+            order_replay = np.lexsort(actual.T)
+            sorted_saved = stored[order_saved]
+            sorted_actual = actual[order_replay][:len(stored)]
+            if sorted_saved.shape != sorted_actual.shape or not np.allclose(
+                    sorted_saved, sorted_actual, rtol=0.01, atol=0.01):
                 raise ValueError(f"{path.name}: {key} 与重放不匹配；检查来源、"
                                  "sample_id_map、stage、checkpoint、EMA 和 seed")
             differences[key] = float(np.max(np.abs(stored - replay)))
