@@ -374,14 +374,15 @@ def replay_records(args, files: dict, pairs: list[dict], split: str):
     for pair in pairs:
         by_sample[pair["sample"]].append(pair)
     records, checks = [], []
+    from selector_utility_probe import train_examples
+    all_data, _ = train_examples(args)
     try:
-        with h5py.File(Path(args.data_path).expanduser() / f"{split}.h5", "r") as data:
-            for sample, sample_pairs in sorted(by_sample.items()):
-                source_id = int(mapping.get(str(sample), sample))
-                if source_id < 0 or source_id >= len(data["data"]):
-                    raise ValueError("样本映射超出 H5 范围")
-                capture = capture_sample(model, selector, intervention,
-                    data["data"][source_id], args.seed + sample, device, args.stage)
+        for sample, sample_pairs in sorted(by_sample.items()):
+            source_id = int(mapping.get(str(sample), sample))
+            if source_id < 0 or source_id >= len(all_data):
+                raise ValueError("样本映射超出数据范围")
+            capture = capture_sample(model, selector, intervention,
+                all_data[source_id], args.seed + sample, device, args.stage)
                 for center in sorted({p["center"] for p in sample_pairs}):
                     difference = verify_artifact(files[sample, center], capture)
                     checks.append({"sample": sample, "source_sample_id": source_id,
