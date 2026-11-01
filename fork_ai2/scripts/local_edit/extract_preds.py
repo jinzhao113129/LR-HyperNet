@@ -160,6 +160,11 @@ def build_model(saved_args, num_category):
         cs_chunk=int(saved_args.get("cs_chunk", 256) or 256),
         cs_tau=float(saved_args.get("cs_tau", 0.1) or 0.1),
         selector_novelty_weight=float(saved_args.get("selector_novelty_weight", 1.0)),
+        adaptive_stop_ratio=float(saved_args.get("adaptive_stop_ratio", 0.3)),
+        adaptive_stop_abs=float(saved_args.get("adaptive_stop_abs", -1.0)),
+        adaptive_min_g=int(saved_args.get("adaptive_min_g", 1)),
+        adaptive_max_g=int(saved_args.get("adaptive_max_g", 16)),
+        adaptive_weights=tuple(saved_args.get("adaptive_weights", (1., 1., 1., 1., 1.))),
     ), {k: saved_args[k] for k in FLAG_KEYS}
 
 
