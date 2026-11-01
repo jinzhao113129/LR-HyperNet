@@ -995,9 +995,16 @@ class FECNet(nn.Module):
                  use_hsel_scaled_coords: bool = False,
                  use_covariance_channel: bool = False,
                  use_density_channel: bool = False,
-                 density_bins: int = 32):
+                 density_bins: int = 32,
+                 adaptive_stop_ratio: float = 0.3,
+                 adaptive_stop_abs: float = -1.0,
+                 adaptive_min_g: int = 1,
+                 adaptive_max_g: int = 16,
+                 adaptive_weights: tuple = (1., 1., 1., 1., 1.)):
         super().__init__()
         _enc_flags = [use_time_enc, use_kda, use_spike_time_enc]
+        if g16_treatment == 'adaptive_g' and not use_remote_g16:
+            raise ValueError("adaptive_g 必须配合 use_remote_g16=True（--remote_g16）")
         if sum(_enc_flags) > 1:
             raise ValueError("time_enc / kda / spike_time_enc 互斥，只能选一个")
         # 修复A：两个 selector 同开时下方 if/elif 会静默走 rp1，必须显式报错
@@ -1110,6 +1117,11 @@ class FECNet(nn.Module):
                                                      cs_chunk=cs_chunk,
                                                      cs_tau=cs_tau,
                                                      selector_novelty_weight=selector_novelty_weight,
+                                                     adaptive_stop_ratio=adaptive_stop_ratio,
+                                                     adaptive_stop_abs=adaptive_stop_abs,
+                                                     adaptive_min_g=adaptive_min_g,
+                                                     adaptive_max_g=adaptive_max_g,
+                                                     adaptive_weights=adaptive_weights,
                                                      stage_idx=i)
             elif use_rp1_selector:
                 local_grouper = RP1SpatialUniformGrouper(self.feature_list[i], self.group_number[i], 24, True, "center", use_scale_norm_fps=use_scale_norm_fps)
