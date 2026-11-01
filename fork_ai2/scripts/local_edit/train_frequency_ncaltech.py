@@ -86,7 +86,7 @@ def parse_args():
     parser.add_argument('--g16_treatment', type=str, default='',
                         choices=['', 'random', 'spatial_fixed', 'euc_far', 'euc_near',
                                  'hyp_far', 'hyp_near', 'rp1_scorer', 'cosine_near',
-                                 'cosine_diverse', 'cosine_mix',
+                                 'cosine_diverse', 'cosine_mix', 'adaptive_g',
                                  'learned', 'learned_v2', 'global_knn', 'csnet'],
                         help='G16 选点准则（需与 --remote_g16 同开）：空串=原 topk'
                              '双曲行为；random/spatial_fixed/euc_far/euc_near/hyp_far/'
@@ -117,6 +117,13 @@ def parse_args():
                              '会写入保存的 args，启动时打印实际值')
     parser.add_argument('--selector_novelty_weight', type=float, default=1.0,
                         help='cosine_diverse/cosine_mix 的 XY 覆盖权重；其余 treatment 不使用')
+    parser.add_argument('--adaptive_stop_ratio', type=float, default=0.3)
+    parser.add_argument('--adaptive_stop_abs', type=float, default=-1.0)
+    parser.add_argument('--adaptive_min_g', type=int, default=1)
+    parser.add_argument('--adaptive_max_g', type=int, default=16)
+    parser.add_argument('--adaptive_weights', nargs=5, type=float,
+                        default=[1., 1., 1., 1., 1.],
+                        help='adaptive_g 五信号权重：XY距离/新颖度/中心不相似/邻居不相似/模长')
     parser.add_argument('--covariance_channel', action='store_true', default=False,
                         help='高斯参数化通道（core idea 2）：每点加体素协方差 [σxx,σyy,σxy]'
                              '3 维（2 阶矩，编码局部形状/方向），embed 输入 4→7，不换 backbone')
@@ -313,6 +320,19 @@ def actual_curvature(name, p):
     return F.softplus(p) + 1e-4
 
 
+def print_adaptive_counts(net, batch_idx: int) -> None:
+    """仅 adaptive_g 每个训练 batch 打印实际点数，不把复制补齐位计入。"""
+    core = net.module if hasattr(net, 'module') else net
+    counts = [group.remote_selector.last_selected_counts.reshape(-1)
+              for group in core.local_grouper_list
+              if getattr(getattr(group, 'remote_selector', None),
+                         'g16_treatment', '') == 'adaptive_g' and
+              group.remote_selector.last_selected_counts is not None]
+    if counts:
+        mean = torch.cat(counts).float().mean().item()
+        print(f"[adaptive_g] batch={batch_idx} mean_selected_g={mean:.4f}", flush=True)
+
+
 def train(net, trainloader, optimizer, criterion, device,args, ema=None):
     net.train()
     train_loss = 0
@@ -332,6 +352,8 @@ def train(net, trainloader, optimizer, criterion, device,args, ema=None):
         if (batch_idx % accum) == 0:
             optimizer.zero_grad()
         logits = net(data)
+        if getattr(args, 'g16_treatment', '') == 'adaptive_g':
+            print_adaptive_counts(net, batch_idx)
         loss = criterion(logits, label)
         # 版本5 --hyperbolic_fusion：曲率正则（0.01*(c-0.4)^2，锚定初始曲率）
         # + Lorentz 径向约束正则（0.01*pen，forward 时缓存在各分支的
@@ -655,6 +677,11 @@ def main(args):
                         cs_chunk=args.cs_chunk,
                         cs_tau=args.cs_tau,
                         selector_novelty_weight=args.selector_novelty_weight,
+                        adaptive_stop_ratio=args.adaptive_stop_ratio,
+                        adaptive_stop_abs=args.adaptive_stop_abs,
+                        adaptive_min_g=args.adaptive_min_g,
+                        adaptive_max_g=args.adaptive_max_g,
+                        adaptive_weights=tuple(args.adaptive_weights),
                         use_rp1_selector=args.rp1_selector,
                         use_hyperbolic_selector=args.hyperbolic_selector,
                         use_spike_time_enc=args.spike_time_enc,
@@ -784,6 +811,8 @@ def main(args):
                       'time_enc','kda','spike_time_enc','remote_g16','g16_treatment','rp1_selector','hyperbolic_selector',
                       'base_dim','fps_groups','learned_M','cs_chunk','cs_tau',
                       'selector_novelty_weight',
+                      'adaptive_stop_ratio','adaptive_stop_abs','adaptive_min_g',
+                      'adaptive_max_g','adaptive_weights',
                       'hyperbolic_classifier','hyperbolic_fusion','hyperbolic_embedding',
                       'hyperbolic_attention','event_mamba_ssm','group_norm',
                       # 2026-10-14 ai2 补：推理工具 FLAG_KEYS 已含此二键，
