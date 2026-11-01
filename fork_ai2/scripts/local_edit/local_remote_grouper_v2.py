@@ -253,7 +253,12 @@ class RemoteSelector(nn.Module):
                  cs_chunk: int = 256,
                  cs_tau: float = 0.1,
                  selector_novelty_weight: float = 1.0,
-                 learned_delta: float = 1e-3):
+                 learned_delta: float = 1e-3,
+                 adaptive_stop_ratio: float = 0.3,
+                 adaptive_stop_abs: float = -1.0,
+                 adaptive_min_g: int = 1,
+                 adaptive_max_g: int = 16,
+                 adaptive_weights: tuple = (1., 1., 1., 1., 1.)):
         """
         Args:
             remote_g: 每个中心点选取的远程邻居数 G
@@ -374,6 +379,11 @@ class RemoteSelector(nn.Module):
                 # 与 csnet/learned 的软选择无关，索引仍为固定硬选。
                 self.selector_mode = 'topk'
                 self.use_cosine = True
+            elif _t == 'adaptive_g':
+                self.selector_mode = 'topk'
+                self._setup_adaptive(adaptive_stop_ratio, adaptive_stop_abs,
+                                     adaptive_min_g, adaptive_max_g,
+                                     adaptive_weights)
             elif _t == 'learned':
                 # 可学习远程选点（core idea 1）：无偏候选池 + 可学习 scorer + ST_k 软 top-k。
                 # 打分走 candidate−centroid + novelty 标量（Codex P0-2：平移不变 + 保空间信号）。
@@ -431,7 +441,7 @@ class RemoteSelector(nn.Module):
                 raise ValueError(
                     f"g16_treatment 未知: '{_t}'（合法值: random/spatial_fixed/"
                     f"euc_far/euc_near/hyp_far/hyp_near/rp1_scorer/cosine_near/"
-                    f"cosine_diverse/cosine_mix/learned/learned_v2/csnet，空串=原行为）")
+                    f"cosine_diverse/cosine_mix/adaptive_g/learned/learned_v2/csnet，空串=原行为）")
             # ==== 启动自检（2026-10-27）：打印真正实例化的选择器，防止旧代码静默跑错 ====
             # 曾出现 gpu 机是旧版（只有 gumbel），--g16_treatment csnet 静默落到旧
             # Gumbel、tau 不生效的事故。这行打印的是构造后的真实状态，grep 即可定性。
@@ -442,6 +452,13 @@ class RemoteSelector(nn.Module):
             elif _t in ('learned', 'learned_v2'):
                 print(f"[G16-SELECTOR] stage={stage_idx} treatment='{_t}' "
                       f"soft_topk=ST_k/sparse learned_M={self.learned_M}", flush=True)
+            elif _t == 'adaptive_g':
+                print(f"[G16-SELECTOR] stage={stage_idx} treatment='adaptive_g' "
+                      f"G=[{self.adaptive_min_g},{self.adaptive_max_g}] "
+                      f"stop_ratio={self.adaptive_stop_ratio} "
+                      f"stop_abs={self.adaptive_stop_abs} "
+                      f"weights={self.adaptive_weights} chunk_centers=64 "
+                      "padding=repeat_last(valid_counts)", flush=True)
             else:
                 print(f"[G16-SELECTOR] stage={stage_idx} treatment='{_t}' "
                       f"selector_mode={self.selector_mode} "
@@ -878,6 +895,103 @@ class RemoteSelector(nn.Module):
                 pool, sim, xy, local_xy[:, start:end]))
         return torch.cat(outputs, dim=1)
 
+    def _setup_adaptive(self, ratio: float, absolute: float, minimum: int,
+                        maximum: int, weights: tuple) -> None:
+        """校验自适应参数；仅新 treatment 调用，不增加 checkpoint 参数。"""
+        if not (1 <= minimum <= maximum <= 16):
+            raise ValueError("adaptive G 须满足 1 <= min_g <= max_g <= 16")
+        if int(minimum) != minimum or int(maximum) != maximum:
+            raise ValueError("adaptive_min_g/adaptive_max_g 必须为整数")
+        if not math.isfinite(ratio) or not 0 <= ratio <= 1:
+            raise ValueError("adaptive_stop_ratio 须为 [0,1] 内有限数")
+        if not math.isfinite(absolute):
+            raise ValueError("adaptive_stop_abs 必须有限")
+        if len(weights) != 5 or any(not math.isfinite(w) or w < 0 for w in weights):
+            raise ValueError("adaptive_weights 须为五个有限非负数")
+        self.adaptive_stop_ratio = float(ratio)
+        self.adaptive_stop_abs = float(absolute)
+        self.adaptive_min_g = int(minimum)
+        self.adaptive_max_g = int(maximum)
+        self.adaptive_weights = tuple(float(w) for w in weights)
+        self.last_selected_counts = None
+
+    def _adaptive_signals(self, center_feat: torch.Tensor, all_feat: torch.Tensor,
+                          local_idx: torch.Tensor, all_xyz: torch.Tensor,
+                          center_xyz: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
+        """计算五项信号；XY 使用本 stage 输入坐标，邻居余弦逐点平均。"""
+        candidate = index_points(all_feat.float(), pool)
+        normalized = F.normalize(candidate, dim=-1)
+        local = index_points(all_feat.float(), local_idx)
+        local_direction = F.normalize(local, dim=-1).mean(dim=-2)
+        xy = index_points(all_xyz.float()[..., 1:3], pool)
+        local_xy = index_points(all_xyz.float()[..., 1:3], local_idx)
+        distance = (xy - center_xyz.float().unsqueeze(-2)[..., 1:3]).norm(dim=-1)
+        novelty = self._spatial_novelty(xy, local_xy)
+        cosine = (normalized * F.normalize(center_feat.float(), dim=-1)
+                  .unsqueeze(-2)).sum(-1)
+        neighbor = (normalized * local_direction.unsqueeze(-2)).sum(-1)
+        return torch.stack((distance, novelty, 1 - cosine, 1 - neighbor,
+                            candidate.norm(dim=-1)), dim=-1)
+
+    def _adaptive_quality(self, signals: torch.Tensor,
+                          valid: torch.Tensor) -> torch.Tensor:
+        """去重后的有效候选独立做总体 z-score，重复填充不参与归一化。"""
+        if not torch.isfinite(signals).all():
+            raise ValueError("adaptive_g 信号出现非有限值")
+        mask = valid.unsqueeze(-1)
+        count = mask.sum(dim=-2, keepdim=True).clamp_min(1)
+        mean = (signals * mask).sum(dim=-2, keepdim=True) / count
+        variance = ((signals - mean).square() * mask).sum(dim=-2, keepdim=True) / count
+        z_score = (signals - mean) / variance.sqrt().clamp_min(1e-3)
+        weights = signals.new_tensor(self.adaptive_weights)
+        return (z_score * weights).sum(-1).masked_fill(~valid, -torch.inf)
+
+    def _adaptive_rank(self, pool: torch.Tensor, quality: torch.Tensor,
+                       valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """降序取点并按阈值停止；返回复制末点的索引和真实长度。"""
+        if (valid.sum(-1) < self.adaptive_min_g).any():
+            raise ValueError("非局部不同候选不足 adaptive_min_g")
+        order = quality.argsort(dim=-1, descending=True, stable=True)
+        values = quality.gather(-1, order)
+        ranked = pool.gather(-1, order)
+        counts = torch.full_like(pool[..., 0], self.adaptive_min_g)
+        maximum = quality.max(-1).values
+        minimum = quality.masked_fill(~valid, torch.inf).min(-1).values
+        active = maximum - minimum > 1e-8
+        for step in range(self.adaptive_min_g, min(self.adaptive_max_g, pool.shape[-1])):
+            following = values[..., step]
+            previous = values[..., :step].mean(-1)
+            active = (active & torch.isfinite(following) &
+                      (following >= previous * self.adaptive_stop_ratio) &
+                      (following >= self.adaptive_stop_abs))
+            counts = counts + active.long()
+        positions = torch.arange(self.adaptive_max_g, device=pool.device)
+        positions = torch.minimum(positions, counts.unsqueeze(-1) - 1)
+        return ranked.gather(-1, positions), counts
+
+    def _adaptive_select(self, centroid_feat: torch.Tensor, all_feat: torch.Tensor,
+                         local_idx: torch.Tensor, all_xyz: torch.Tensor,
+                         center_xyz: torch.Tensor) -> torch.Tensor:
+        """每64中心复用 geometry 候选池；先去重再评分，保留有效前缀。"""
+        if all_xyz is None or center_xyz is None:
+            raise ValueError("adaptive_g 需要 all_xyz 和 center_xyz")
+        outputs, counts = [], []
+        for start in range(0, centroid_feat.shape[1], 64):
+            end = start + 64
+            centers = centroid_feat[:, start:end]
+            local = local_idx[:, start:end]
+            coords = center_xyz[:, start:end]
+            pool, _, _ = self._geometry_pool(centers, all_feat, local, all_xyz, coords)
+            pool = pool.sort(dim=-1).values
+            valid = torch.ones_like(pool, dtype=torch.bool)
+            valid[..., 1:] = pool[..., 1:] != pool[..., :-1]
+            signals = self._adaptive_signals(centers, all_feat, local, all_xyz, coords, pool)
+            indices, length = self._adaptive_rank(pool, self._adaptive_quality(signals, valid), valid)
+            outputs.append(indices)
+            counts.append(length)
+        self.last_selected_counts = torch.cat(counts, dim=1).detach()
+        return torch.cat(outputs, dim=1)
+
     def forward(self, centroid_feat: torch.Tensor, all_feat: torch.Tensor,
                 local_idx: torch.Tensor,
                 global_anchor: torch.Tensor | None = None,
@@ -969,6 +1083,15 @@ class RemoteSelector(nn.Module):
                 remote_idx = self._geometry_select(
                     centroid_feat, all_feat, local_idx, all_xyz, center_xyz)
             self._g16_cache(remote_idx, local_idx, all_xyz, all_feat)
+            return remote_idx
+        if g16_on and self.g16_treatment == 'adaptive_g':
+            with torch.no_grad():
+                remote_idx = self._adaptive_select(
+                    centroid_feat, all_feat, local_idx, all_xyz, center_xyz)
+            self._g16_cache(remote_idx, local_idx, all_xyz, all_feat)
+            sink = getattr(self, '_g16_sink', None)
+            if sink:
+                sink[-1]['valid_counts'] = self.last_selected_counts
             return remote_idx
         # 选择只产生离散索引，无需梯度；no_grad 避免距离矩阵挂计算图浪费显存
         with torch.no_grad():
@@ -1462,6 +1585,11 @@ class LocalRemoteGrouper(nn.Module):
                  cs_chunk: int = 256,
                  cs_tau: float = 0.1,
                  selector_novelty_weight: float = 1.0,
+                 adaptive_stop_ratio: float = 0.3,
+                 adaptive_stop_abs: float = -1.0,
+                 adaptive_min_g: int = 1,
+                 adaptive_max_g: int = 16,
+                 adaptive_weights: tuple = (1., 1., 1., 1., 1.),
                  **kwargs):
         """
         Args:
@@ -1552,6 +1680,11 @@ class LocalRemoteGrouper(nn.Module):
                                               cs_chunk=cs_chunk,
                                               cs_tau=cs_tau,
                                               selector_novelty_weight=selector_novelty_weight,
+                                              adaptive_stop_ratio=adaptive_stop_ratio,
+                                              adaptive_stop_abs=adaptive_stop_abs,
+                                              adaptive_min_g=adaptive_min_g,
+                                              adaptive_max_g=adaptive_max_g,
+                                              adaptive_weights=adaptive_weights,
                                               channel=channel)
         if hyperbolic_type == "euclidean":
             self.hyper_agg = EuclideanRemoteAggregator(channel, temperature_init=1.0)
@@ -1620,6 +1753,40 @@ class LocalRemoteGrouper(nn.Module):
         final_local = cand_dist.topk(knn_k, dim=-1, largest=False)[1]
         idx = torch.gather(cand_idx, -1, final_local)
         return idx.sort(dim=-1)[0]
+
+    def _aggregate_adaptive(self, remote_points: torch.Tensor,
+                            remote_xytp: torch.Tensor | None = None) -> torch.Tensor:
+        """按真实长度分组调用原聚合器；补齐索引不参与均值或注意力。"""
+        B, S, G, C = remote_points.shape
+        counts = self.remote_selector.last_selected_counts
+        if counts is None or counts.shape != (B, S):
+            raise RuntimeError("adaptive_g 缺少本次前向的有效长度")
+        flat = remote_points.reshape(-1, G, C)
+        lengths = counts.reshape(-1)
+        if ((lengths < 1) | (lengths > G)).any():
+            raise ValueError("adaptive_g 有效长度超出索引范围")
+        aggregate = torch.zeros_like(flat[:, 0])
+        residual = torch.zeros_like(aggregate)
+        penalties = []
+        for length in lengths.unique(sorted=True).tolist():
+            mask = lengths == length
+            selected = flat[mask, :length]
+            if self.remote_kda_enc is not None:
+                times = remote_xytp.reshape(-1, G, 4)[mask, :length, 0:1]
+                selected = selected + self.remote_kda_enc(
+                    selected.unsqueeze(1), times.unsqueeze(1)).squeeze(1)
+            aggregate[mask] = self.hyper_agg(selected.unsqueeze(1)).squeeze(1)
+            residual[mask] = selected.mean(dim=1)
+            pen = getattr(self.hyper_agg, 'last_radial_pen', None)
+            if pen is not None:
+                penalties.append(pen * mask.sum())
+        if penalties:
+            self.hyper_agg.last_radial_pen = torch.stack(penalties).sum() / len(flat)
+        if self.training and self.remote_stochastic_depth > 0:
+            keep = torch.rand(len(flat), 1, device=flat.device, dtype=flat.dtype)
+            aggregate = torch.where(keep > self.remote_stochastic_depth,
+                                    aggregate, residual)
+        return aggregate.reshape(B, S, C)
 
     def forward(self, xytp: torch.Tensor, points: torch.Tensor):
         """
@@ -1708,27 +1875,12 @@ class LocalRemoteGrouper(nn.Module):
                     # xytp 用本 stage 完整 4 通道（含 p）——profile agent 吃 [B,N,4]
                     rec['xytp'] = xytp.detach()
             remote_points = index_points(points, remote_idx)               # [B, S, G, C]
-            if self.remote_kda_enc is not None:
-                # 远程 KDA 时间编码（EventMamba 启发）：残差加法同局部 KDA 接法，
-                # KDA 内部按时间戳自动排序，恢复远程点间的时序因果关系
-                remote_xytp = index_points(xytp, remote_idx)               # [B, S, G, 4]
-                remote_points = remote_points + self.remote_kda_enc(
-                    remote_points, remote_xytp[..., 0:1])                  # [B, S, G, C]
-            # ---- stochastic depth：训练时以 p_drop 概率逐样本跳过双曲远程聚合支路 ----
-            # 展平为 [M, G, C]（M = B*S，每个 FPS 组独立伯努利），跳过的组直接用
-            # 残差 x.mean(dim=1)（组均值）代替 hyper_agg 输出；推理（self.training=False）
-            # 时不跳过。keep mask [M,1] 与 [M,C] 广播。
-            p_drop = self.remote_stochastic_depth
-            if self.training and p_drop > 0.0:
-                G, Cc = remote_points.shape[2], remote_points.shape[3]
-                M = B * S
-                flat = remote_points.reshape(M, G, Cc)                     # [M, G, C]
-                agg = self.hyper_agg(flat.unsqueeze(1)).squeeze(1)         # [M, C]
-                residual = flat.mean(dim=1)                                # [M, C]
-                keep = (torch.rand(M, 1, device=flat.device, dtype=flat.dtype) > p_drop)
-                remote_feat = torch.where(keep, agg, residual).reshape(B, S, -1)  # [B, S, C]
+            if self.remote_selector.g16_treatment == 'adaptive_g':
+                remote_xytp = (index_points(xytp, remote_idx)
+                               if self.remote_kda_enc is not None else None)
+                remote_feat = self._aggregate_adaptive(remote_points, remote_xytp)
             else:
-                remote_feat = self.hyper_agg(remote_points)                # [B, S, C]
+                remote_feat = self._aggregate_fixed(remote_points, xytp, remote_idx)
         remote_feat = self.remote_dropout(remote_feat)
         # ---- 门控融合（SECNet 启发，remote_gate=True 时生效）----
         # gate = sigmoid(MLP([remote_feat, centroid_feat]))：由中心点特征决定
@@ -1746,6 +1898,25 @@ class LocalRemoteGrouper(nn.Module):
         remote_feat = remote_feat.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)
         new_points = torch.cat([grouped_points, remote_feat], dim=-1)  # [B, S, K, 2C+4]
         return new_xytp, new_points
+
+    def _aggregate_fixed(self, remote_points: torch.Tensor, xytp: torch.Tensor,
+                         remote_idx: torch.Tensor) -> torch.Tensor:
+        """原固定长度 KDA/stochastic-depth 聚合路径，计算与 RNG 顺序保持不变。"""
+        B, S = remote_points.shape[:2]
+        if self.remote_kda_enc is not None:
+            remote_xytp = index_points(xytp, remote_idx)
+            remote_points = remote_points + self.remote_kda_enc(
+                remote_points, remote_xytp[..., 0:1])
+        p_drop = self.remote_stochastic_depth
+        if self.training and p_drop > 0.0:
+            G, Cc = remote_points.shape[2], remote_points.shape[3]
+            M = B * S
+            flat = remote_points.reshape(M, G, Cc)
+            agg = self.hyper_agg(flat.unsqueeze(1)).squeeze(1)
+            residual = flat.mean(dim=1)
+            keep = (torch.rand(M, 1, device=flat.device, dtype=flat.dtype) > p_drop)
+            return torch.where(keep, agg, residual).reshape(B, S, -1)
+        return self.hyper_agg(remote_points)
 
 
 # ============================================================================
