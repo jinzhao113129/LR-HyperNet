@@ -4,3 +4,4 @@
 *.md text eol=lf
 *.tex text eol=lf
 *.sbatch text eol=lf
+checkpoints_backup/**/*.pth filter=lfs diff=lfs merge=lfs -text
