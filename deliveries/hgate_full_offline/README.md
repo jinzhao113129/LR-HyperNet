@@ -71,7 +71,7 @@ git -C LR-HyperNet rev-parse HEAD > code_commit.txt
 
 ## 4. 自行取得官方原始事件数据
 
-交付包会随附原始事件包`raw/Caltech101.zip`，接收方不必重复下载，也不搬运我们HPC上的train.h5/test.h5。**H5由接收方在自己的实例中生成**。以下官方链接仅在原始包未随附或校验失败时作为备用来源；GPU实例不能联网时，用另一台联网电脑下载，再通过平台文件上传或内网拷入。
+代码压缩包不包含数据集。原始事件包`Caltech101.zip`由用户单独通过网盘提供，接收方下载后放到`$TRANSFER/raw/Caltech101.zip`；不必从官方重复下载，也不搬运我们HPC上的train.h5/test.h5。**H5由接收方在自己的实例中生成**。以下官方链接仅在原始包未随附或校验失败时作为备用来源；GPU实例不能联网时，用另一台联网电脑下载，再通过平台文件上传或内网拷入。
 
 原始事件数据来源：
 
@@ -89,7 +89,7 @@ git -C LR-HyperNet rev-parse HEAD > code_commit.txt
 python3 verify_raw.py /path/to/Caltech101.zip > raw_archive_check.json
 ```
 
-脚本只依赖标准库，报告实际字节数、MD5及SHA256。不匹配就停止，先核对来源，不跳过校验。下载中的HPC外层包叫`ncaltech101_raw.zip`，里面还套有真正的`Caltech101.zip`；最终交付应提取内层事件包，保留其原始字节并单独校验，不把外层zip改名冒充内层。实际大小与校验值以交付根目录的`raw_source_info.json`为准（数据下载完成后生成）。
+脚本只依赖标准库，报告实际字节数、MD5及SHA256。不匹配就停止，先核对来源，不跳过校验。下载中的HPC外层包叫`ncaltech101_raw.zip`，里面还套有真正的`Caltech101.zip`；最终交付应提取内层事件包，保留其原始字节并单独校验，不把外层zip改名冒充内层。实际大小与校验值以网盘随数据提供的`raw_source_info.json`和`Caltech101.zip.sha256`为准；这两份校验文件不需要包含任何账号信息。
 
 ## 5. 接收方本地生成10240点全量H5
 
@@ -152,14 +152,14 @@ TARGET_COMPATIBILITY_CONFIRMED=yes bash scripts/build_env_online.sh /path/to/env
 
 ## 7. 搬运目录与校验
 
-整理成以下结构，代码目录取本交付目录的内容：
+代码包、网盘数据和离线环境分别传输；接收方最后整理成以下结构。代码压缩包本身不包含原始数据、H5或环境二进制：
 
 ```text
 hgate_transfer/
   code/                       # README、frozen、scripts及全部Python文件
   code_commit.txt
   machine_info.txt
-  raw/Caltech101.zip            # 官方原始事件包；不必预先提供H5
+  raw/Caltech101.zip            # 通过网盘单独下载后放入；代码zip不含数据
   env_bundle/hgate_py310_cu121.tar.gz
   env_bundle/requirements.lock
   env_bundle/wheelhouse/*.whl

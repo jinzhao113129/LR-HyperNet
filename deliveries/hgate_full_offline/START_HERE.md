@@ -5,7 +5,7 @@
 你的平台需要自己创建实例，**不使用Slurm**。
 
 1. 创建一台有四张3090的Linux实例，确认持久化存储目录和剩余租期。
-2. 把收到的交付包上传/拷入实例。原始数据会随包提供，解压后应有`raw/Caltech101.zip`；不需要我们的HPC账号，不必重复下载数据。
+2. 把收到的交付包上传/拷入实例。代码包不含数据；另从用户的网盘下载`Caltech101.zip`，核对随附SHA后放到交付根目录的`raw/Caltech101.zip`。不需要我们的HPC账号，不必从官方重复下载。
 3. 在`code/`目录运行`bash scripts/collect_machine.sh > machine_info.txt 2>&1`，回传机器信息。环境依赖包是否已附，以根目录交付说明为准；不要在断网机器上尝试联网安装。
 4. 按`README.md`第8节设置WORK等路径，安装或确认镜像已有环境。不要默认系统盘、`/tmp`或HOME在实例销毁后还保留。
 5. 运行`bash scripts/prepare_from_official_raw.sh "$TRANSFER/raw/Caltech101.zip" "$DATA" "$ENV"`，自己生成10240点全量H5。数据种子1234，模型训练seed42。

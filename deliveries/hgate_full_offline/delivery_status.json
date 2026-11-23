@@ -22,5 +22,7 @@
   "wheelhouse_built": false,
   "four_gpu_validation": "pending_on_recipient_machine",
   "data_files_in_repository": false,
-  "credentials_in_repository": false
+  "credentials_in_repository": false,
+  "dataset_distribution": "separate_cloud_drive",
+  "dataset_in_code_archive": false
 }
