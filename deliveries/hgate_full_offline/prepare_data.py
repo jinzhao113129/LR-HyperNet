@@ -126,7 +126,8 @@ def main() -> None:
     parser.add_argument('--raw-root', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--split-file', type=Path)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--seed', type=int, default=1234,
+                        help='数据划分/预处理种子，不是模型训练seed42')
     parser.add_argument('--num-points', type=int, default=10240)
     args = parser.parse_args()
     classes, records = record_list(args.raw_root, args.seed, args.split_file)
@@ -144,7 +145,8 @@ def main() -> None:
         files[split].update(sha256=sha256(path), bytes=path.stat().st_size)
     meta = dict(num_points=args.num_points, classes=classes, records=records,
                 seed=args.seed, windows_ms=WINDOWS, files=files, skipped=skipped,
-                split_provenance='provided_manifest' if args.split_file else 'reconstructed_seed42_not_official',
+                split_provenance='provided_manifest' if args.split_file else f'reconstructed_seed{args.seed}_not_official',
+                mark_namespace='global', augmentation_seed_strategy='record_window_variant',
                 transforms_sha256=sha256(Path(__file__).with_name('official_transforms.py')))
     dump_json(args.out / 'dataset_manifest.json', meta)
     print(json.dumps(dict(files=files, skipped=len(skipped)), indent=2), flush=True)

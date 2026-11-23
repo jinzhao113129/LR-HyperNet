@@ -1,10 +1,12 @@
 {
   "date": "2026-11-23",
   "protocol": "self_full_10240_not_exact_82.4_reproduction",
-  "dataset_primary": "existing_HPC_62703_5226_numpy_split_seed1234",
+  "dataset_primary": "generate_on_recipient_from_official_raw_10240",
+  "data_preparation_seed": 1234,
   "training_seed": 42,
   "component": "hyperbolic_gate_only",
   "world_size": 4,
+  "platform": "self_created_single_instance_four_3090_no_slurm",
   "micro_batch": 4,
   "accumulation": 2,
   "sync_batch_norm": true,

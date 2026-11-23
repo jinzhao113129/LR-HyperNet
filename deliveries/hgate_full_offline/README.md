@@ -4,11 +4,13 @@
 
 本轮固定使用10240点全量数据，训练本地FECNet骨干＋双曲距离门控。不启用G16选点、双曲注意力或其他实验组件。四张3090共同训练一个模型。
 
+**接收方是自行创建GPU实例的平台，不是Slurm集群。** 流程是创建一台带四张3090的实例，在该实例终端直接运行本页命令；不使用`sbatch`、`srun`或`squeue`，也不需要我们的HPC账号。
+
 论文写8192点，公开生成器和我们HPC已有H5为10240点。本次选择可获得的10240管线继续实验，不等待官方未公开实现。**不把本包称为82.4%的精确复现。** Stage-2是我们自行补充的三窗口方案，也不使用官方82.377%权重初始化。
 
 ## 0. 现在能交什么，还缺什么
 
-已提供：冻结模型、四卡训练/续训入口、既有H5登记、原始数据备用处理入口、离线环境构建与安装脚本、Stage-2、CPU测试源码。
+已提供：冻结模型、四卡训练/续训入口、官方原始数据本地生成入口、离线环境构建与安装脚本、Stage-2、CPU测试源码。主流程不需要HPC账号或现成H5。
 
 尚未提供：朋友机器的系统/驱动信息、据此生成的环境压缩包和完整依赖锁、四卡CUDA实测。模型早期版本有9项CPU测试通过；随后增加了既有H5接入等改动，用户要求暂不测试，所以**最新交付代码未重新测试**。不能把旧测试结果当作本版四卡验证。
 
@@ -18,13 +20,13 @@
 
 | 项目 | 本轮设置 |
 |---|---|
-| 数据来源 | 优先原样搬运HPC的`ncaltech101_official_gen/train.h5`、`test.h5` |
-| 训练／测试 | 62703／5226个窗口，6967／1742条原始记录 |
+| 数据来源 | 接收方自行取得官方原始事件包，在本机生成H5 |
+| 训练／测试 | 原始记录80/20划分；62703／5226窗口仅为历史参考，不强凑数量 |
 | 输入布局 | `(t,x,y,p)`，每窗口10240点，101类别 |
 | 时间窗口 | 35–65、135–165、235–265ms |
-| H5已有增强 | 训练每窗口原始、裁剪、时间反转；测试无增强 |
+| 生成时增强 | 训练每窗口原始、裁剪、时间反转；测试无增强 |
 | 在线增强／EMA／早停 | 全部关闭 |
-| 训练种子 | 42；与历史数据划分种子1234分开 |
+| 种子 | 数据划分/预处理1234；模型训练42 |
 | 模型宽度／首层分组 | 64→132→268→540／2048 |
 | 组件 | 只启用双曲门控，原有傅里叶模块保持 |
 | 训练 | 150轮，AdamW，lr0.001，weight decay0.0001，Cosine |
@@ -36,7 +38,15 @@ SyncBN一次前向统计覆盖四卡共16条样本，梯度累积后有效batch3
 
 本地骨干是历史继承的门控重建版，不等同于官方简化发布版。门控的净收益应与同一骨干、数据和配方的内部对照比较；已有旧基线只有在配置完全匹配且训练完整时才复用。本包不自动启动额外基线实验。
 
-## 2. 朋友先回传机器信息（无需联网）
+## 2. 创建四卡实例并确认环境
+
+1. 在对方平台创建**同一实例内四张RTX3090**的实例，不是创建四个互不相通的单卡实例。
+2. 选择Linux x86_64镜像，优先已有Python3.10和可用PyTorch的镜像。候选依赖为Torch2.3.1/CUDA12.1，但仍需根据实际驱动确认；不要求重装或升级驱动。
+3. 确认CPU内存和至少100GB可用磁盘，并询问平台哪些挂载目录是持久化存储。原始包、生成H5、环境和checkpoint都放在可保留的目录，不能默认`/tmp`或系统盘重建后仍在。
+4. 创建后进入实例终端，运行`nvidia-smi`，确认四张3090均在同一实例且已分配给本实验。
+5. 确认平台是否允许内网/文件上传、实例关机或销毁后是否保留磁盘、是否有空闲回收和最长运行时限。不要照搬我们原租赁平台的回收规则。
+
+有条件时先在CPU环境处理原始数据，再开GPU实例训练，减少等待费用；是否能挂载同一持久盘以对方平台实际能力为准。不安排无意义GPU任务保活。
 
 将本目录通过U盘或内网拷到机器后运行：
 
@@ -46,7 +56,7 @@ bash scripts/collect_machine.sh > machine_info.txt 2>&1
 
 回传`machine_info.txt`。需要Linux版本、x86_64架构、glibc、驱动、内存、磁盘和`nvidia-smi topo -m`。只知道“四张3090”不能保证环境包兼容。
 
-不修改驱动，不使用登录口令或私钥打包。若机器由Slurm管理，下面的四卡命令必须放进管理员分配的GPU作业内执行，不能直接在登录节点启动。
+本机信息采集不需要联网，不修改驱动，不包含登录口令或私钥。已有镜像环境如能通过依赖和CUDA检查，可直接使用；缺依赖时走第6节的离线打包，不在离线实例里运行联网pip安装。
 
 ## 3. 联网端取得代码
 
@@ -59,38 +69,9 @@ git -C LR-HyperNet rev-parse HEAD > code_commit.txt
 
 实际需要的是`LR-HyperNet/deliveries/hgate_full_offline/`整个目录，不能只拷训练入口。`frozen/models/`为已冻结的本地模型快照；`source_manifest.json`记录SHA256。不得用其他机器上同名的FECNet覆盖它。
 
-## 4. 数据主路线：搬运已经生成的全量H5
+## 4. 自行取得官方原始事件数据
 
-这次不必重新下载/处理原始数据。优先复用已核查的两个HPC文件，避免改变历史划分和增强。
-
-| HPC路径，相对`/home/jnguan/JiangYouxin/ZhaoJin` | 字节数 |
-|---|---:|
-| `ncaltech101_official_gen/train.h5` | 10,277,031,928 |
-| `ncaltech101_official_gen/test.h5` | 856,552,800 |
-
-HPC访问需要机构网络。密钥仅在自己的电脑使用，不能交给朋友或放进交付包。在PowerShell中下载到一块空间足够的本地盘：
-
-```powershell
-New-Item -ItemType Directory -Force D:\hgate_transfer\data | Out-Null
-scp -i "$env:USERPROFILE\.ssh\lcr_key" -P 2223 jnguan@10.160.22.46:/home/jnguan/JiangYouxin/ZhaoJin/ncaltech101_official_gen/train.h5 D:\hgate_transfer\data\train.h5
-scp -i "$env:USERPROFILE\.ssh\lcr_key" -P 2223 jnguan@10.160.22.46:/home/jnguan/JiangYouxin/ZhaoJin/ncaltech101_official_gen/test.h5 D:\hgate_transfer\data\test.h5
-```
-
-下载不是本次已执行步骤。上面的字节数来自只读核查；**大小相同不能代替SHA256**。下载后由来源端与接收端分别计算SHA256比对；HPC全文件校验涉及顺序读取约11GB，按平台要求放到CPU作业/数据传输节点执行，不在登录节点做重I/O。
-
-不要误拷：`ncaltech101_official_baidu`是3596/934轻量单窗；`archive/old_data/data`是8192早期小集，均不是本轮数据。
-
-旧H5只有`data/label/mark`。环境安装好后，运行登记脚本生成旁路清单：
-
-```bash
-"$ENV/bin/python" register_existing_h5.py --data "$DATA" --generator-order-confirmed
-```
-
-这一步不修改H5，只写`dataset_manifest.json`并计算完整文件SHA。必须确认该H5出自历史生成器：每条训练记录连续9行，顺序为窗口0/1/2，每窗原始/裁剪/反转；测试连续3行。脚本检查行数、连续性和标签，窗口含义仍明确标为根据生成器推导，不伪装成H5原生字段。
-
-旧H5的train和test各自从0编号mark，跨集合重号不说明泄漏；我们没有官方原始文件划分清单，不能仅凭mark证明作者划分。历史数据划分固定NumPy seed1234，但Torch增强随机流未固定，重新生成不保证逐元素复原。因此优先原样搬运，不擅自重生成替换。
-
-## 5. 原始数据备用路线（主路线拿不到才用）
+交付包会随附原始事件包`raw/Caltech101.zip`，接收方不必重复下载，也不搬运我们HPC上的train.h5/test.h5。**H5由接收方在自己的实例中生成**。以下官方链接仅在原始包未随附或校验失败时作为备用来源；GPU实例不能联网时，用另一台联网电脑下载，再通过平台文件上传或内网拷入。
 
 原始事件数据来源：
 
@@ -98,24 +79,53 @@ scp -i "$env:USERPROFILE\.ssh\lcr_key" -P 2223 jnguan@10.160.22.46:/home/jnguan/
 - Mendeley V1：https://data.mendeley.com/datasets/cy6cvx3ryv/1
 - DOI：10.17632/cy6cvx3ryv.1；CC BY 4.0。
 
-下载**事件版**`Caltech101.zip`，不是普通图像Caltech101。作者页面提供镜像。官方生态读取器记录该事件包MD5为`66201824eabb0239c7ab992480b50ba3`，来源：https://github.com/fangwei123456/spikingjelly/blob/master/spikingjelly/datasets/n_caltech101.py 。分类训练不需要边界框annotations。
+进入页面下载事件版 **Caltech101.zip**；作者页面也提供镜像。不要下载普通RGB图像Caltech101，不要下载仅含标注的Caltech101_annotations.zip，也不要用旧8192小集或百度盘3596/934单窗H5代替。
+
+原始事件包已发布MD5：`66201824eabb0239c7ab992480b50ba3`。来源：https://github.com/fangwei123456/spikingjelly/blob/master/spikingjelly/datasets/n_caltech101.py 。本包直接读取作者的5字节bin格式，无需安装spikingjelly或torchvision。
+
+联网端可先检查：
 
 ```bash
 python3 verify_raw.py /path/to/Caltech101.zip > raw_archive_check.json
-unzip /path/to/Caltech101.zip -d /path/to/raw
 ```
 
-`verify_raw.py`只用Python标准库，输出实下载字节数、MD5与SHA。公开页面本轮未取得原压缩包的可靠精确字节数，不编造；按上述MD5验收。如果取得的是HPC的`ncaltech101_raw.zip`，已知大小3,992,155,345字节，但尚未确认与作者zip字节相同，不能绕过校验。重新打包文件必须另留来源、文件清单及自己的SHA。
+脚本只依赖标准库，报告实际字节数、MD5及SHA256。不匹配就停止，先核对来源，不跳过校验。下载中的HPC外层包叫`ncaltech101_raw.zip`，里面还套有真正的`Caltech101.zip`；最终交付应提取内层事件包，保留其原始字节并单独校验，不把外层zip改名冒充内层。实际大小与校验值以交付根目录的`raw_source_info.json`为准（数据下载完成后生成）。
 
-解压后要求`RAW/类别名/*.bin`，101类别。运行：
+## 5. 接收方本地生成10240点全量H5
+
+先按第6–8节安装离线环境，再执行本节；不是要求裸系统直接安装Torch。
+
+准备：原始zip位于`$TRANSFER/raw/Caltech101.zip`；`$DATA`为全新输出目录，不能预先创建。直接在实例终端执行下列命令；预处理使用CPU，不需要Slurm或另起四卡任务。
 
 ```bash
-"$ENV/bin/python" prepare_data.py --raw-root /path/to/raw/Caltech101 --out /path/to/new_full_10240 --seed 42 --num-points 10240
+bash scripts/prepare_from_official_raw.sh "$TRANSFER/raw/Caltech101.zip" "$DATA" "$ENV"
 ```
 
-备用生成器按文件名排序，固定seed42做记录级80/20划分，再处理三窗、训练裁剪/反转，流式写H5。输出`split_manifest.json`、`dataset_manifest.json`和明确的skip记录；可用`--split-file`复用之前冻结的完整文件名划分。
+这一条命令会校验原始包、解压、生成H5并检查数据。预期解压结构：
 
-**这条备用路线不是旧HPC seed1234数据，也不是作者原始划分。** 不强凑62703/5226；缺窗不得静默补齐。不要把备用生成的数据与旧HPC模型交叉评估后当同协议结果。若产生缺窗，Stage-2会报错，先回收skip清单，由研究负责人决定处理口径。
+```text
+Caltech101/
+  accordion/*.bin
+  airplanes/*.bin
+  ...其余类别目录...
+```
+
+若zip目录布局不同，脚本会停止并要求确认目录，不猜测路径。已自行解压时也可以直接运行：
+
+```bash
+"$ENV/bin/python" prepare_data.py --raw-root /path/to/Caltech101 --out "$DATA" --seed 1234 --num-points 10240
+"$ENV/bin/python" preflight.py --data "$DATA"
+```
+
+处理规则：稳定排序原始文件，以数据种子1234固定记录级80/20划分；分别取35–65、135–165、235–265ms三个窗口；按公开生成器的最近端点、毫秒量化去重、下采样/有放回补点和归一化方式处理；训练每窗保留原始、随机裁剪、时间反转三个版本，测试每窗只保留原始版本。
+
+输出`train.h5`、`test.h5`、`split_manifest.json`、`dataset_manifest.json`，明确保存文件名、类别、原始文件SHA、划分、窗口和增强元数据。每个增强动作还单独固定Python/NumPy/Torch随机流；可用`--split-file`复用完整文件名划分。
+
+历史HPC数量为62703／5226，但新生成以实际记录数和skip清单为准，不强凑数量。缺窗明确记录，不能静默补齐。生成失败保留现场，重跑用新输出目录；不覆盖旧H5。
+
+这是按公开处理方式生成的**自有10240全量数据**。作者原始划分未公布；即使使用1234，也不能保证与作者或旧HPC增强数组逐元素相同。论文8192声明与公开10240生成器存在差异，本轮已明确选择10240，不阻塞实验。数据种子1234与训练seed42分开。
+
+`register_existing_h5.py`只保留给已有旧HPC H5的兼容场景；**本次主流程不要运行它**，新生成器已直接写好数据清单和窗口字段。
 
 ## 6. 联网Linux机器构建离线环境
 
@@ -149,8 +159,7 @@ hgate_transfer/
   code/                       # README、frozen、scripts及全部Python文件
   code_commit.txt
   machine_info.txt
-  data/train.h5
-  data/test.h5
+  raw/Caltech101.zip            # 官方原始事件包；不必预先提供H5
   env_bundle/hgate_py310_cu121.tar.gz
   env_bundle/requirements.lock
   env_bundle/wheelhouse/*.whl
@@ -169,26 +178,29 @@ python3 /absolute/path/hgate_transfer/code/seal_transfer.py verify /absolute/pat
 
 ## 8. 离线端安装及数据检查
 
-以下示例将整包放到`/srv/hgate_transfer`。允许换目录，但后续变量必须一致：
+先选定平台确认会保留的存储目录。以下以`/data/hgate`为示例，**不是对平台挂载点的承诺**；若平台实际路径不同，先改`WORK`。没有该路径权限时不要sudo修改系统，使用平台提供的可写目录。把交付包解压到该目录，形成`$WORK/hgate_transfer/`。
 
 ```bash
-TRANSFER=/srv/hgate_transfer
+WORK=/data/hgate
+TRANSFER="$WORK/hgate_transfer"
 CODE="$TRANSFER/code"
-DATA="$TRANSFER/data"
-ENV="$HOME/envs/hgate"
-RUNS="$HOME/hgate_runs"
+DATA="$WORK/generated/full_10240_seed1234"
+ENV="$WORK/envs/hgate"
+RUNS="$WORK/runs"
 cd "$CODE"
 bash scripts/install_env_offline.sh "$TRANSFER/env_bundle" "$ENV"
 mkdir -p "$RUNS"
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 "$ENV/bin/python" preflight.py --require-four
-"$ENV/bin/python" register_existing_h5.py --data "$DATA" --generator-order-confirmed
+bash scripts/prepare_from_official_raw.sh "$TRANSFER/raw/Caltech101.zip" "$DATA" "$ENV"
 "$ENV/bin/python" preflight.py --data "$DATA" --require-four > "$RUNS/preflight.json"
 ```
 
-安装目标目录必须不存在；安装只使用本地wheel与`--no-index`。登记清单也拒绝覆盖；若搬运包已包含正确的`dataset_manifest.json`，跳过登记，只做校验。
+安装目标目录必须不存在；安装只使用本地wheel与`--no-index`。数据输出目录也必须不存在；若已成功生成且manifest完整，跳过生成命令，只做校验，不重复解压或覆盖。
 
 环境安装预期输出`ENV_OK`、四张可见卡；preflight应记录10240点及101类别。发现任何GPU上有他人任务，先协调，脚本不kill进程。`CUDA_VISIBLE_DEVICES`按分配的卡设置，不擅自占用卡。
+
+如果平台镜像已有可用环境，先将`ENV`设为该环境根目录，检查`$ENV/bin/python`存在并运行preflight；确认torch、numpy、h5py版本和CUDA后，跳过`install_env_offline.sh`。已有环境与候选环境不同时需记录实际版本，不能假装已使用锁定环境。
 
 ## 9. 接收方短时验收（本轮尚未执行）
 
@@ -215,7 +227,7 @@ nohup bash scripts/run_four_gpu.sh train "$DATA" "$RUNS/hgate_full_s42" "$ENV" >
 echo $!
 ```
 
-保持不变：150轮、四卡每卡4、累积2、seed42。训练采样按epoch更新，训练尾部不足整批丢弃；测试采样不补齐、不重复，最终计数必须等于5226。只由rank0保存日志与权重。
+保持不变：150轮、四卡每卡4、累积2、seed42。训练采样按epoch更新，训练尾部不足整批丢弃；测试采样不补齐、不重复，最终计数必须等于本次dataset_manifest记录的测试行数（历史参考5226）。只由rank0保存日志与权重。
 
 ```bash
 tail -n 10 "$RUNS/hgate_full_s42_launcher.log"
@@ -232,6 +244,8 @@ nohup bash scripts/run_four_gpu.sh resume "$DATA" "$RUNS/hgate_full_s42" "$ENV" 
 ```
 
 保存并恢复raw模型、AdamW、Cosine、已完成epoch、各rank的CPU/CUDA/Python/NumPy随机流及DataLoader随机状态。只恢复完整epoch边界，中断的半轮重跑。拒绝改world size、batch、累积、seed或数据清单后续跑。
+
+`nohup`只能应对终端/SSH断开，**不能保证实例关机、销毁或平台回收后训练继续**。实例重建后，先重新确认持久盘内容、四卡和环境路径，重新设置本页变量，再运行resume。旧进程仍活着时不要启动第二份。停机/到期前回收checkpoint和日志，具体关机、续租和磁盘保留操作按对方平台执行，本包不自动控制实例。
 
 `best_checkpoint.pth`仅作探索记录；`last_checkpoint.pth`为150轮终点主权重。看到`completed.json`才算完整Stage-1完成。不要将中途最高准确率当150轮终局。
 
@@ -255,7 +269,7 @@ CUDA_VISIBLE_DEVICES=0 "$ENV/bin/python" stage2_pipeline.py evaluate --features 
 
 骨干严格恢复并冻结，只接受150轮raw last。提取train/test分别固定seed43/42。Stage-2从零训练100轮，SGD lr0.1、momentum0.9、wd0.0001、Cosine、batch128；按原始记录取10%训练记录作验证，三个增强版本不跨训练/验证。只在最后评估测试集，不用测试成绩挑头。
 
-旧H5的窗口与增强含义依据已确认生成器顺序推导；缺窗、重复元数据或标签不一致则停止，不静默丢记录。Stage-2如中断，当前入口需选新目录重新训练头；Stage-1已具备完整续训，不要误用两个入口。
+新生成的H5有显式window/variant字段，Stage-2按字段组合三窗；仅兼容旧H5时才根据历史生成器顺序推导。缺窗、重复元数据或标签不一致则停止，不静默丢记录。Stage-2如中断，当前入口需选新目录重新训练头；Stage-1已具备完整续训，不要误用两个入口。
 
 ## 12. 出错时回传什么
 
@@ -264,8 +278,8 @@ CUDA_VISIBLE_DEVICES=0 "$ENV/bin/python" stage2_pipeline.py evaluate --features 
 | pip访问网络／缺wheel | 停止，联网端补包并重新封存，不在离线端临时改版本 |
 | GLIBC/驱动/CUDA不兼容 | 回传machine_info和完整报错；重建匹配环境，不升级系统驱动 |
 | 原始zip MD5不符 | 核对是否图像版或重新打包版；不跳过来源验证 |
-| H5不是62703/5226×10240 | 检查是否拿成轻量/8192旧集，不reshape改样本数 |
-| 缺manifest/window字段 | 旧HPC数据先登记；不覆盖H5，不假造原始文件名 |
+| H5不符合manifest或不是10240点 | 检查原始数据来源和skip清单，不强凑62703/5226，不reshape改样本数 |
+| 缺manifest/window字段 | 本次应由prepare_data.py生成；回查生成日志，不拿轻量H5混用 |
 | NCCL超时／某rank退出 | 回传四卡日志和topo；torchrun结束本作业，勿kill其他用户进程 |
 | OOM | 回传完整报错、GPU占用和配置，不中途改正式batch |
 | 输出目录存在 | 新实验用新目录；原实验用显式resume；不要删除旧结果 |
@@ -273,4 +287,4 @@ CUDA_VISIBLE_DEVICES=0 "$ENV/bin/python" stage2_pipeline.py evaluate --features 
 
 结果回收：代码commit、`machine_info.txt`、环境版本/锁文件、数据manifest、preflight、两份benchmark、全部metrics/launcher日志、best/last与completed；Stage-2另交source/split/test.json。不要交账号凭据。
 
-复核联系人可直接转述：本次交付为10240自有全量双曲门控，基于现有HPC H5；Stage-2为自建attn_concat。最新代码暂未重测、依赖包待机器信息后构建，不能称四卡已验收。请审查数据接入、SyncBN/DDP、续训和本文操作命令，勿改当前融合快测。
+复核联系人可直接转述：本次交付为10240自有全量双曲门控，由接收方取得官方原始事件数据并生成H5；Stage-2为自建attn_concat。最新代码暂未重测、依赖包待机器信息后构建，不能称四卡已验收。请审查数据接入、SyncBN/DDP、续训和本文操作命令，勿改当前融合快测。
