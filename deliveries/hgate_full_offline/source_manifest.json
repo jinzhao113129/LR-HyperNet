@@ -1,0 +1,18 @@
+{
+  "frozen/models/FECNet.py": {
+    "sha256": "8f4f44333fd39d275b58a5101f76b34b333cb3b7ad1f67458e8910dff76f1aa3",
+    "source": "codex_outputs\\hgate_cosine_quick_20261123\\bundle\\models\\FECNet.py"
+  },
+  "frozen/models/modules.py": {
+    "sha256": "335d54d5938e538321d74a32f6cbd542097978ee04f0c4cadea9f9415245cb4f",
+    "source": "codex_outputs\\hgate_cosine_quick_20261123\\bundle\\models\\modules.py"
+  },
+  "frozen/models/local_remote_grouper.py": {
+    "sha256": "ae8442364c6a9ae4c5885e287befdc919c1f52e0090b566afdae9e5afd7b891a",
+    "source": "codex_outputs\\hgate_cosine_quick_20261123\\bundle\\models\\local_remote_grouper.py"
+  },
+  "frozen/models/local_remote_grouper_v2.py": {
+    "sha256": "f2316d806dd7d951cedc78176e02cec970727fd0d49537efc623718c240cef9c",
+    "source": "codex_outputs\\hgate_cosine_quick_20261123\\bundle\\models\\local_remote_grouper_v2.py"
+  }
+}

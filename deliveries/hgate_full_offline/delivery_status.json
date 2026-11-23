@@ -1,0 +1,24 @@
+{
+  "date": "2026-11-23",
+  "protocol": "self_full_10240_not_exact_82.4_reproduction",
+  "dataset_primary": "existing_HPC_62703_5226_numpy_split_seed1234",
+  "training_seed": 42,
+  "component": "hyperbolic_gate_only",
+  "world_size": 4,
+  "micro_batch": 4,
+  "accumulation": 2,
+  "sync_batch_norm": true,
+  "stage2": "self_implemented_attn_concat_not_verified_official",
+  "gpu_training_started_by_this_delivery": false,
+  "runtime_tests_after_user_pause": false,
+  "historical_cpu_tests": {
+    "passed": 9,
+    "note": "Earlier draft only; existing-H5 integration and later changes have not been rerun."
+  },
+  "target_machine_information_received": false,
+  "offline_environment_archive_built": false,
+  "wheelhouse_built": false,
+  "four_gpu_validation": "pending_on_recipient_machine",
+  "data_files_in_repository": false,
+  "credentials_in_repository": false
+}
